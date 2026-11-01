@@ -630,6 +630,10 @@ function Get-AvailableResolutions {
             } |
             Sort-Object -Property @(
                 @{ Expression = { if ($_.PSObject.Properties.Match('fps').Count -gt 0 -and $null -ne $_.fps) { [double]$_.fps } else { 0.0 } }; Descending = $true },
+                @{ Expression = {
+                    $vc = if ($_.PSObject.Properties.Match('vcodec').Count -gt 0 -and $null -ne $_.vcodec) { [string]$_.vcodec } else { '' }
+                    if ($vc -match '^(avc1|h264)') { 3 } elseif ($vc -match '^vp0?9') { 2 } elseif ($vc -match '^av01') { 0 } else { 1 }
+                }; Descending = $true },
                 @{ Expression = { Get-FormatEstimatedBytes -FormatObj $_ -DurationSeconds $durationSec }; Descending = $true },
                 @{ Expression = { if ($_.PSObject.Properties.Match('tbr').Count -gt 0 -and $null -ne $_.tbr) { [double]$_.tbr } else { 0.0 } }; Descending = $true }
             ) |
@@ -800,12 +804,18 @@ function Get-YtDlpFormatSelector {
         $fmtExpr = "bv*[height<=$cleanQ]+ba/b[height<=$cleanQ]"
     }
 
+    $sortExpr = if ($cleanFmt -eq 'webm') {
+        'res,fps,vcodec:vp9,vcodec:h264,acodec:opus'
+    } else {
+        'res,fps,vcodec:h264,vcodec:vp9,acodec:m4a'
+    }
+
     return [PSCustomObject]@{
         FormatExpression  = $fmtExpr
         MergeOutputFormat = $cleanFmt
         ExtractAudio      = $false
         AudioFormat       = $null
-        Arguments         = @('-f', $fmtExpr, '--merge-output-format', $cleanFmt)
+        Arguments         = @('-f', $fmtExpr, '-S', $sortExpr, '--merge-output-format', $cleanFmt)
     }
 }
 
