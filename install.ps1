@@ -1,6 +1,3 @@
-# VideoDL Installer (install.ps1)
-# Kurulum ve bagimlilik yonetimi betigi
-
 & {
     Set-StrictMode -Version Latest
     $ErrorActionPreference = 'Stop'
@@ -91,7 +88,24 @@
             $ErrorActionPreference = $prevEap
         }
         if ($ytCode -eq 0 -and -not [string]::IsNullOrWhiteSpace(($ytVer | Out-String))) {
-            Write-InstallMessage -Message "Sistemde mevcut yt-dlp bulundu: $($existingYtDlp.Source) (S\u00fcr\u00fcm: $(($ytVer | Select-Object -First 1).ToString().Trim()))" -Color Green
+            $verStr = ($ytVer | Select-Object -First 1).ToString().Trim()
+            $isOld = $false
+            if ($verStr -match '^(?<y>\d{4})\.(?<m>\d{2})\.(?<d>\d{2})') {
+                try {
+                    $verDate = New-Object -TypeName DateTime -ArgumentList @([int]$Matches['y'], [int]$Matches['m'], [int]$Matches['d'])
+                    if (([DateTime]::UtcNow - $verDate).TotalDays -gt 60) {
+                        $isOld = $true
+                    }
+                } catch {
+                    $isOld = $false
+                }
+            }
+            if ($isOld) {
+                Write-InstallMessage -Message "Sistemdeki yt-dlp s\u00fcr\u00fcm\u00fc ($verStr) eski; g\u00fcncel resmi s\u00fcr\u00fcm indiriliyor..." -Color Yellow
+                $existingYtDlp = $null
+            } else {
+                Write-InstallMessage -Message "Sistemde g\u00fcncel yt-dlp bulundu: $($existingYtDlp.Source) (S\u00fcr\u00fcm: $verStr)" -Color Green
+            }
         } else {
             $existingYtDlp = $null
         }

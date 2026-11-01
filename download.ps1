@@ -544,6 +544,26 @@ function Get-FormatEstimatedBytes {
     return 0
 }
 
+function Get-StandardResolutionTier {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$FormatGroup,
+
+        [Parameter(Mandatory = $true)]
+        [int]$RawHeight
+    )
+    foreach ($fmt in $FormatGroup) {
+        if ($fmt.PSObject.Properties.Match('format_note').Count -gt 0 -and $null -ne $fmt.format_note) {
+            $note = [string]$fmt.format_note
+            if ($note -match '^(?<tier>4320|2160|1440|1080|720|480|360|240|144)p\b') {
+                return [int]$Matches['tier']
+            }
+        }
+    }
+    return $RawHeight
+}
+
 function Get-AvailableResolutions {
     [CmdletBinding()]
     param(
@@ -588,8 +608,13 @@ function Get-AvailableResolutions {
     $groupedByHeight = $videoFormats | Group-Object -Property { [int]$_.height } | Sort-Object -Property { [int]$_.Name } -Descending
 
     foreach ($group in $groupedByHeight) {
-        $heightVal = [int]$group.Name
+        $actualHeight = [int]$group.Name
+        $tierVal = Get-StandardResolutionTier -FormatGroup @($group.Group) -RawHeight $actualHeight
         $bestForHeight = $group.Group |
+            Where-Object -FilterScript {
+                $proto = if ($_.PSObject.Properties.Match('protocol').Count -gt 0 -and $null -ne $_.protocol) { [string]$_.protocol } else { 'https' }
+                $proto -notmatch 'm3u8'
+            } |
             Sort-Object -Property @(
                 @{ Expression = { if ($_.PSObject.Properties.Match('fps').Count -gt 0 -and $null -ne $_.fps) { [double]$_.fps } else { 0.0 } }; Descending = $true },
                 @{ Expression = { Get-FormatEstimatedBytes -FormatObj $_ -DurationSeconds $durationSec }; Descending = $true },
@@ -597,6 +622,9 @@ function Get-AvailableResolutions {
             ) |
             Select-Object -First 1
 
+        if ($null -eq $bestForHeight) {
+            $bestForHeight = $group.Group | Select-Object -First 1
+        }
         $fpsVal = 30
         if ($bestForHeight.PSObject.Properties.Match('fps').Count -gt 0 -and $null -ne $bestForHeight.fps -and [double]$bestForHeight.fps -gt 0) {
             $fpsVal = [int][Math]::Round([double]$bestForHeight.fps)
@@ -610,9 +638,9 @@ function Get-AvailableResolutions {
         }
 
         $results.Add([PSCustomObject]@{
-            Height             = $heightVal
-            Quality            = [string]$heightVal
-            Label              = "${heightVal}p"
+            Height             = $tierVal
+            Quality            = [string]$actualHeight
+            Label              = "${tierVal}p"
             Fps                = $fpsVal
             EstimatedSizeBytes = [int64][Math]::Round($totalBytes)
             SizeText           = Format-FileSizeText -Bytes $totalBytes
@@ -695,8 +723,9 @@ function Select-EffectiveQuality {
     $reqHeight = [int]$cleanReq
     $exactMatch = $videoRes | Where-Object -FilterScript { [int]$_.Height -eq $reqHeight } | Select-Object -First 1
     if ($null -ne $exactMatch) {
+        $effQ = if ($exactMatch.PSObject.Properties.Match('Quality').Count -gt 0 -and -not [string]::IsNullOrWhiteSpace([string]$exactMatch.Quality)) { [string]$exactMatch.Quality } else { [string]$exactMatch.Height }
         return [PSCustomObject]@{
-            EffectiveQuality = [string]$exactMatch.Height
+            EffectiveQuality = $effQ
             FallbackUsed     = $false
             Message          = $null
         }
@@ -704,20 +733,22 @@ function Select-EffectiveQuality {
 
     $lowerMatch = $videoRes | Where-Object -FilterScript { [int]$_.Height -lt $reqHeight } | Sort-Object -Property { [int]$_.Height } -Descending | Select-Object -First 1
     if ($null -ne $lowerMatch) {
-        $fallbackH = [string]$lowerMatch.Height
+        $fallbackLabelH = [string]$lowerMatch.Height
+        $effQ = if ($lowerMatch.PSObject.Properties.Match('Quality').Count -gt 0 -and -not [string]::IsNullOrWhiteSpace([string]$lowerMatch.Quality)) { [string]$lowerMatch.Quality } else { $fallbackLabelH }
         return [PSCustomObject]@{
-            EffectiveQuality = $fallbackH
+            EffectiveQuality = $effQ
             FallbackUsed     = $true
-            Message          = "Bilgi: İstenen ${reqHeight}p çözünürlük mevcut değil, en yakın düşük çözünürlüğe (${fallbackH}p) düşüldü."
+            Message          = "Bilgi: İstenen ${reqHeight}p çözünürlük mevcut değil, en yakın düşük çözünürlüğe (${fallbackLabelH}p) düşüldü."
         }
     }
 
     $lowestAvailable = $videoRes | Sort-Object -Property { [int]$_.Height } | Select-Object -First 1
-    $lowestH = [string]$lowestAvailable.Height
+    $lowestLabelH = [string]$lowestAvailable.Height
+    $effQ = if ($lowestAvailable.PSObject.Properties.Match('Quality').Count -gt 0 -and -not [string]::IsNullOrWhiteSpace([string]$lowestAvailable.Quality)) { [string]$lowestAvailable.Quality } else { $lowestLabelH }
     return [PSCustomObject]@{
-        EffectiveQuality = $lowestH
+        EffectiveQuality = $effQ
         FallbackUsed     = $true
-        Message          = "Bilgi: İstenen ${reqHeight}p çözünürlük mevcut değil, mevcut en düşük çözünürlük (${lowestH}p) seçildi."
+        Message          = "Bilgi: İstenen ${reqHeight}p çözünürlük mevcut değil, mevcut en düşük çözünürlük (${lowestLabelH}p) seçildi."
     }
 }
 
@@ -864,8 +895,11 @@ function Convert-YtDlpErrorToTurkish {
     if ($RawError -match '(?i)(not available in your country|geo-restricted|blocked in your country|uploader has not made this video available in your country)') {
         return 'Hata: Bu video bulunduğunuz bölgede (coğrafi kısıtlama nedeniyle) kullanılamıyor.'
     }
-    if ($RawError -match '(?i)(Sign in to confirm your age|age-restricted|Private video|login required|members-only|cookies|HTTP Error 401|HTTP Error 403|This video is private)') {
+    if ($RawError -match '(?i)(Sign in to confirm your age|age-restricted|Private video|login required|members-only|Please sign in|cookies|HTTP Error 401|This video is private)') {
         return 'Hata: Bu içerik yaş sınırı veya oturum açma gerektiriyor (-Cookies <tarayici> parametresini deneyin).'
+    }
+    if ($RawError -match '(?i)(HTTP Error 403)') {
+        return "Hata: Video akışı sunucu tarafından reddedildi (HTTP 403). 'download --update' ile yt-dlp sürümünü güncellemeyi veya -Cookies <tarayici> kullanmayı deneyin."
     }
     if ($RawError -match '(?i)(getaddrinfo failed|Name or service not known|Network is unreachable|Connection reset|timed out|URLError|Failed to establish a new connection|TransportError)') {
         return 'Hata: Ağ bağlantısı kurulamadı. İnternet bağlantınızı veya hedef adresi kontrol edin.'
@@ -878,6 +912,37 @@ function Convert-YtDlpErrorToTurkish {
     }
 
     return 'Hata: Video indirilemedi. Ham hata detaylarını görmek için -Verbose parametresini ekleyin.'
+}
+
+function Test-YtDlpVersionOutdated {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$YtDlpExePath
+    )
+    $prevEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $verOut = & $YtDlpExePath --version 2>&1
+        $verCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    if ($verCode -ne 0 -or $null -eq $verOut) {
+        return $true
+    }
+    $verStr = ($verOut | Select-Object -First 1).ToString().Trim()
+    if ($verStr -match '^(?<y>\d{4})\.(?<m>\d{2})\.(?<d>\d{2})') {
+        try {
+            $verDate = New-Object -TypeName DateTime -ArgumentList @([int]$Matches['y'], [int]$Matches['m'], [int]$Matches['d'])
+            if (([DateTime]::UtcNow - $verDate).TotalDays -gt 60) {
+                return $true
+            }
+        } catch {
+            return $false
+        }
+    }
+    return $false
 }
 
 function Resolve-ToolExecutable {
@@ -947,12 +1012,17 @@ function Assert-Dependencies {
         [switch]$IsInteractive
     )
     $ytDlpExe = Resolve-ToolExecutable -ToolName 'yt-dlp'
-    if ([string]::IsNullOrWhiteSpace($ytDlpExe)) {
+    $needsYtDlpDownload = [string]::IsNullOrWhiteSpace($ytDlpExe)
+    if (-not $needsYtDlpDownload -and (Test-YtDlpVersionOutdated -YtDlpExePath $ytDlpExe)) {
+        Write-Host 'Sistemdeki yt-dlp sürümü eski; YouTube uyumluluğu için en güncel sürüm indiriliyor...' -ForegroundColor Yellow
+        $needsYtDlpDownload = $true
+    }
+    if ($needsYtDlpDownload) {
         if (-not (Test-Path -LiteralPath $script:BinDir)) {
             New-Item -ItemType Directory -Path $script:BinDir -Force | Out-Null
         }
         $targetYtDlp = Join-Path -Path $script:BinDir -ChildPath 'yt-dlp.exe'
-        Write-Host 'yt-dlp bulunamadı, resmi GitHub sürümü indiriliyor...' -ForegroundColor Cyan
+        Write-Host 'yt-dlp resmi GitHub sürümü indiriliyor...' -ForegroundColor Cyan
         Invoke-WebRequest -Uri 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe' -OutFile $targetYtDlp -UseBasicParsing
         if ((Get-Item -LiteralPath $targetYtDlp).Length -lt 1MB) {
             throw 'İndirilen yt-dlp.exe bozuk veya eksik.'
@@ -1034,7 +1104,13 @@ function Invoke-VideoDlUpdate {
                 Write-Verbose $updateText
             }
             if ($updateText -match '(?i)(installed yt-dlp with pip|using the wheel from PyPi|package manager)') {
-                Write-Host 'Bilgi: Sistemdeki yt-dlp paket yöneticisi (pip/winget) ile kurulmuş; yerel kopya kontrol ediliyor.' -ForegroundColor Yellow
+                Write-Host 'Bilgi: Sistemdeki yt-dlp paket yöneticisi ile kurulmuş; VideoDL için en güncel bağımsız yt-dlp.exe indiriliyor...' -ForegroundColor Cyan
+                if (-not (Test-Path -LiteralPath $script:BinDir)) {
+                    New-Item -ItemType Directory -Path $script:BinDir -Force | Out-Null
+                }
+                $targetYtDlp = Join-Path -Path $script:BinDir -ChildPath 'yt-dlp.exe'
+                Invoke-WebRequest -Uri 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe' -OutFile $targetYtDlp -UseBasicParsing
+                Write-Host 'Güncel yt-dlp.exe başarıyla indirildi.' -ForegroundColor Green
             } else {
                 Write-Host 'yt-dlp güncelleme kontrolü tamamlandı.' -ForegroundColor Green
             }
@@ -1316,7 +1392,7 @@ function Invoke-VideoDownload {
 
     try {
         $ErrorActionPreference = 'Continue'
-        & $deps.YtDlpPath @ytArgs 2>$errFile
+        & $deps.YtDlpPath @ytArgs 2>$errFile | Out-Host
         $dlExitCode = $LASTEXITCODE
         $downloadCompleted = $true
     } finally {
