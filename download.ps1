@@ -1483,6 +1483,94 @@ function Expand-Base64StringsInText {
     return ($decodedBlocks -join "`n")
 }
 
+function Expand-JsVariableCipherStreams {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$Content,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PageUrl
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Content)) {
+        return ''
+    }
+
+    $varMat = [regex]::Match($Content, '(?i)(?:sources\s*:\s*\[\s*\{[^\}]*?\bfile|\bfile)\s*:\s*(?<v>[a-zA-Z_$][a-zA-Z0-9_$]*)\b')
+    if (-not $varMat.Success) {
+        return ''
+    }
+    $varName = $varMat.Groups['v'].Value
+    if ($varName -in @('true', 'false', 'null', 'undefined', 'window', 'document', 'this')) {
+        return ''
+    }
+
+    $scriptBlocks = [regex]::Matches($Content, '(?is)<script[^>]*>(?<body>.*?)</script>')
+    $targetJs = ''
+    foreach ($sb in $scriptBlocks) {
+        $body = $sb.Groups['body'].Value
+        if ($body -match "\b(?:var|let|const)\s+$([regex]::Escape($varName))\s*=") {
+            $targetJs = $body
+            break
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($targetJs)) {
+        return ''
+    }
+
+    $hostName = ''
+    $parsedUri = $null
+    if ([System.Uri]::TryCreate($PageUrl, [System.UriKind]::Absolute, [ref]$parsedUri)) {
+        $hostName = $parsedUri.Host
+    }
+    $originUrl = Get-UrlOrigin -InputUrl $PageUrl
+
+    $cscriptExe = Join-Path -Path $env:SystemRoot -ChildPath 'System32\cscript.exe'
+    if (Test-Path -LiteralPath $cscriptExe -PathType Leaf) {
+        $polyHeader = @"
+var location = { hostname: "$hostName", href: "$PageUrl", origin: "$originUrl" };
+var window = { location: location };
+var document = { location: location, cookie: "" };
+function btoa(s) { return String(s); }
+function atob(input) {
+    var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+    var str = String(input).replace(/=+$/, "");
+    var output = "";
+    for (var bc = 0, bs = 0, buffer, idx = 0; buffer = str.charAt(idx++); ~buffer && (bs = bc % 4 ? bs * 64 + buffer : buffer, bc++ % 4) ? output += String.fromCharCode(255 & bs >> (-2 * bc & 6)) : 0) {
+        buffer = chars.indexOf(buffer);
+    }
+    return output;
+}
+"@
+        $tempJs = Join-Path -Path $env:TEMP -ChildPath "videodl_cipher_$([guid]::NewGuid().ToString('N')).js"
+        $prevEap = $ErrorActionPreference
+        try {
+            $fullJs = $polyHeader + "`r`n" + $targetJs + "`r`nif (typeof $varName !== 'undefined') { WScript.Echo('`"' + $varName + '`"'); }"
+            [System.IO.File]::WriteAllText($tempJs, $fullJs, [System.Text.Encoding]::ASCII)
+            $ErrorActionPreference = 'Continue'
+            $csOut = & $cscriptExe //NoLogo //E:JScript //T:5 $tempJs 2>$null
+            if ($LASTEXITCODE -eq 0 -and $null -ne $csOut) {
+                $joined = ($csOut -join "`n").Trim()
+                if (-not [string]::IsNullOrWhiteSpace($joined)) {
+                    return $joined
+                }
+            }
+        } catch {
+            Write-Verbose "cscript JS cipher çözümleme hatası: $($_.Exception.Message)"
+        } finally {
+            $ErrorActionPreference = $prevEap
+            if (Test-Path -LiteralPath $tempJs) {
+                Remove-Item -LiteralPath $tempJs -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    return ''
+}
+
 function Test-StreamHasAuthToken {
     [CmdletBinding()]
     param(
@@ -1493,7 +1581,7 @@ function Test-StreamHasAuthToken {
     if ([string]::IsNullOrWhiteSpace($StreamUrl)) {
         return $false
     }
-    return [bool]($StreamUrl -match '(?i)([?&](token|expires|exp|sig|signature|hash|md5|tms|hdnea|wmsAuthSign|Policy|Key-Pair-Id|auth|st|e)=)')
+    return [bool]($StreamUrl -match '(?i)([?&](token|expires|exp|sig|signature|hash|md5|tms|hdnea|wmsAuthSign|Policy|Key-Pair-Id|auth|st|e|s)=)')
 }
 
 function Test-IsLikelyMediaStreamUrl {
@@ -1562,13 +1650,18 @@ function Extract-StreamsAndIframesFromContent {
         $drmDetails = $Matches[0]
     }
 
-    $unpackedJs = Expand-PackedJavaScript -Content $Content
-    $decodedB64 = Expand-Base64StringsInText -Content ($Content + "`n" + $unpackedJs)
+    # Sahte honeypot URL içeren ld+json bloklarını birincil taramadan ayır
+    $contentWithoutLdJson = [regex]::Replace($Content, '(?is)<script[^>]*type\s*=\s*["'']application/ld\+json["''][^>]*>.*?</script>', '')
+
+    $cipherDecoded = Expand-JsVariableCipherStreams -Content $contentWithoutLdJson -PageUrl $PageUrl
+    $unpackedJs = Expand-PackedJavaScript -Content $contentWithoutLdJson
+    $decodedB64 = Expand-Base64StringsInText -Content ($contentWithoutLdJson + "`n" + $unpackedJs)
 
     $segmentsToScan = @(
-        [PSCustomObject]@{ Text = $Content;    Method = "$SourceLabel - Regex" },
-        [PSCustomObject]@{ Text = $unpackedJs; Method = 'Katman 2d (Packed JS Çözücü)' },
-        [PSCustomObject]@{ Text = $decodedB64; Method = 'Katman 2e (Base64 Decode)' }
+        [PSCustomObject]@{ Text = $cipherDecoded;        Method = 'Katman 2d (JS Cipher Değişken Çözücü)' },
+        [PSCustomObject]@{ Text = $unpackedJs;           Method = 'Katman 2d (Packed JS Çözücü)' },
+        [PSCustomObject]@{ Text = $decodedB64;           Method = 'Katman 2e (Base64 Decode)' },
+        [PSCustomObject]@{ Text = $contentWithoutLdJson; Method = "$SourceLabel - Regex" }
     )
 
     $originUrl = Get-UrlOrigin -InputUrl $PageUrl
@@ -2545,8 +2638,36 @@ function Invoke-FfmpegStreamDownload {
     $ffArgs.Add($UserAgent)
     $ffArgs.Add('-headers')
     $ffArgs.Add($headerBlock)
+
+    $isHlsLike = ($StreamUrl -match '(?i)(\.m3u8|(manifest|playlist|master|sublist)[^/]*\.(txt|m3u8))')
+    if ($isHlsLike) {
+        $ffArgs.Add('-f')
+        $ffArgs.Add('hls')
+    }
     $ffArgs.Add('-allowed_extensions')
     $ffArgs.Add('ALL')
+
+    $prevEapProbe = $ErrorActionPreference
+    $hlsHelpText = ''
+    try {
+        $ErrorActionPreference = 'Continue'
+        $hlsHelpLines = & $FfmpegPath -v quiet -h demuxer=hls 2>$null
+        if ($null -ne $hlsHelpLines) {
+            $hlsHelpText = ($hlsHelpLines -join "`n")
+        }
+    } finally {
+        $ErrorActionPreference = $prevEapProbe
+    }
+
+    if ($hlsHelpText -match 'allowed_segment_extensions') {
+        $ffArgs.Add('-allowed_segment_extensions')
+        $ffArgs.Add('ALL')
+    }
+    if ($hlsHelpText -match 'extension_picky') {
+        $ffArgs.Add('-extension_picky')
+        $ffArgs.Add('0')
+    }
+
     $ffArgs.Add('-protocol_whitelist')
     $ffArgs.Add('file,http,https,tcp,tls,crypto,data')
     $ffArgs.Add('-i')
@@ -2569,6 +2690,11 @@ function Invoke-FfmpegStreamDownload {
             $ffArgs.Add('0:a?')
             $ffArgs.Add('-map')
             $ffArgs.Add('0:s?')
+        } else {
+            $ffArgs.Add('-map')
+            $ffArgs.Add('0:v:0?')
+            $ffArgs.Add('-map')
+            $ffArgs.Add('0:a:0?')
         }
         $ffArgs.Add('-c')
         $ffArgs.Add('copy')
@@ -2584,7 +2710,7 @@ function Invoke-FfmpegStreamDownload {
     try {
         $ErrorActionPreference = 'Continue'
         $ffArgsArr = $ffArgs.ToArray()
-        & $FfmpegPath @ffArgsArr
+        & $FfmpegPath @ffArgsArr | Out-Host
         return ($LASTEXITCODE -eq 0)
     } finally {
         $ErrorActionPreference = $prevEap
@@ -2668,60 +2794,64 @@ function Invoke-Layer4DownloadAndVerify {
                 $outFile = Join-Path -Path $OutputDir -ChildPath "${safeTitle}_$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()).$ext"
             }
 
-            # 4d-1: yt-dlp --hls-prefer-ffmpeg + Referer + User-Agent
-            Write-Host "  -> [Katman 4] yt-dlp (--hls-prefer-ffmpeg + Referer) ile indiriliyor: $tryUrl" -ForegroundColor Cyan
-            $printFile = Join-Path -Path $env:TEMP -ChildPath "videodl_l4_path_$([guid]::NewGuid().ToString('N')).txt"
-            $customTemplate = Join-Path -Path $OutputDir -ChildPath "$safeTitle [%(id)s].%(ext)s"
-            $ytArgs = Get-YtDlpArgumentList `
-                -TargetUrl $tryUrl `
-                -SelectedQuality $SelectedQuality `
-                -SelectedFormat $ext `
-                -IsAudioOnly:$IsAudioOnly `
-                -OutputDirectory $OutputDir `
-                -SubtitleLangs $SubtitleLangs `
-                -BrowserCookies $BrowserCookies `
-                -FfmpegPath $ffmpegDir `
-                -PrintFilePath $printFile `
-                -NoCheckCertificate `
-                -HlsPreferFfmpeg `
-                -RefererUrl $cand.Referer `
-                -OriginUrl $cand.Origin `
-                -UserAgent $script:DefaultUserAgent `
-                -CustomOutputTemplate $customTemplate
+            $isDisguisedTxtHls = ($tryUrl -match '(?i)\.(txt)(\?|$)')
 
-            $prevEap = $ErrorActionPreference
-            $ytExit = 1
-            try {
-                $ErrorActionPreference = 'Continue'
-                & $Deps.YtDlpPath @ytArgs 2>$null
-                $ytExit = $LASTEXITCODE
-            } finally {
-                $ErrorActionPreference = $prevEap
-            }
+            if (-not $isDisguisedTxtHls) {
+                # 4d-1: yt-dlp --hls-prefer-ffmpeg + Referer + User-Agent
+                Write-Host "  -> [Katman 4] yt-dlp (--hls-prefer-ffmpeg + Referer) ile indiriliyor: $tryUrl" -ForegroundColor Cyan
+                $printFile = Join-Path -Path $env:TEMP -ChildPath "videodl_l4_path_$([guid]::NewGuid().ToString('N')).txt"
+                $customTemplate = Join-Path -Path $OutputDir -ChildPath "$safeTitle [%(id)s].%(ext)s"
+                $ytArgs = Get-YtDlpArgumentList `
+                    -TargetUrl $tryUrl `
+                    -SelectedQuality $SelectedQuality `
+                    -SelectedFormat $ext `
+                    -IsAudioOnly:$IsAudioOnly `
+                    -OutputDirectory $OutputDir `
+                    -SubtitleLangs $SubtitleLangs `
+                    -BrowserCookies $BrowserCookies `
+                    -FfmpegPath $ffmpegDir `
+                    -PrintFilePath $printFile `
+                    -NoCheckCertificate `
+                    -HlsPreferFfmpeg `
+                    -RefererUrl $cand.Referer `
+                    -OriginUrl $cand.Origin `
+                    -UserAgent $script:DefaultUserAgent `
+                    -CustomOutputTemplate $customTemplate
 
-            $ytProducedFile = $null
-            if (Test-Path -LiteralPath $printFile) {
-                $pLines = @(Get-Content -LiteralPath $printFile -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-                if ($pLines.Count -gt 0) {
-                    $ytProducedFile = $pLines[-1].Trim()
+                $prevEap = $ErrorActionPreference
+                $ytExit = 1
+                try {
+                    $ErrorActionPreference = 'Continue'
+                    & $Deps.YtDlpPath @ytArgs 2>$null | Out-Host
+                    $ytExit = $LASTEXITCODE
+                } finally {
+                    $ErrorActionPreference = $prevEap
                 }
-                Remove-Item -LiteralPath $printFile -Force -ErrorAction SilentlyContinue
-            }
-            if ($ytExit -eq 0 -and -not [string]::IsNullOrWhiteSpace($ytProducedFile) -and (Test-Path -LiteralPath $ytProducedFile)) {
-                $probe = Test-MediaFileWithFfprobe -FilePath $ytProducedFile
-                if ($probe.IsValid) {
-                    return [PSCustomObject]@{
-                        Success      = $true
-                        FilePath     = $probe.FilePath
-                        SizeText     = $probe.SizeText
-                        QualityText  = $probe.QualitySummary
-                        StreamUrl    = $tryUrl
-                        WorkingLayer = "Katman 4d ($($cand.DiscoveryLayer) + yt-dlp --hls-prefer-ffmpeg)"
-                        Notes        = if ($cand.IsAes128) { 'AES-128 HLS otomatik çözüldü; ffprobe ile doğrulandı.' } elseif ($cand.HasToken) { 'Token ve Referer korunarak indirildi; ffprobe ile doğrulandı.' } else { 'ffprobe ile doğrulandı.' }
+
+                $ytProducedFile = $null
+                if (Test-Path -LiteralPath $printFile) {
+                    $pLines = @(Get-Content -LiteralPath $printFile -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                    if ($pLines.Count -gt 0) {
+                        $ytProducedFile = $pLines[-1].Trim()
                     }
+                    Remove-Item -LiteralPath $printFile -Force -ErrorAction SilentlyContinue
                 }
-                Write-Host '  -> [Katman 4e] İndirilen dosya doğrulamadan geçemedi, doğrudan ffmpeg (Katman 4a/4c) deneniyor...' -ForegroundColor Yellow
-                Remove-Item -LiteralPath $ytProducedFile -Force -ErrorAction SilentlyContinue
+                if ($ytExit -eq 0 -and -not [string]::IsNullOrWhiteSpace($ytProducedFile) -and (Test-Path -LiteralPath $ytProducedFile)) {
+                    $probe = Test-MediaFileWithFfprobe -FilePath $ytProducedFile
+                    if ($probe.IsValid) {
+                        return [PSCustomObject]@{
+                            Success      = $true
+                            FilePath     = $probe.FilePath
+                            SizeText     = $probe.SizeText
+                            QualityText  = $probe.QualitySummary
+                            StreamUrl    = $tryUrl
+                            WorkingLayer = "Katman 4d ($($cand.DiscoveryLayer) + yt-dlp --hls-prefer-ffmpeg)"
+                            Notes        = if ($cand.IsAes128) { 'AES-128 HLS otomatik çözüldü; ffprobe ile doğrulandı.' } elseif ($cand.HasToken) { 'Token ve Referer korunarak indirildi; ffprobe ile doğrulandı.' } else { 'ffprobe ile doğrulandı.' }
+                        }
+                    }
+                    Write-Host '  -> [Katman 4e] İndirilen dosya doğrulamadan geçemedi, doğrudan ffmpeg (Katman 4a/4c) deneniyor...' -ForegroundColor Yellow
+                    Remove-Item -LiteralPath $ytProducedFile -Force -ErrorAction SilentlyContinue
+                }
             }
 
             # 4a/4b/4c: Doğrudan ffmpeg (çoklu ses/altyazı map ile, başarısızsa standart copy ile)
@@ -2785,7 +2915,7 @@ function Invoke-Layer4DownloadAndVerify {
                 $prevEap = $ErrorActionPreference
                 try {
                     $ErrorActionPreference = 'Continue'
-                    & $nm3u8Exe @nmArgs 2>$null
+                    & $nm3u8Exe @nmArgs 2>$null | Out-Host
                 } finally {
                     $ErrorActionPreference = $prevEap
                 }
@@ -2820,7 +2950,7 @@ function Invoke-Layer4DownloadAndVerify {
                 $prevEap = $ErrorActionPreference
                 try {
                     $ErrorActionPreference = 'Continue'
-                    & $streamlinkExe @slArgs 2>$null
+                    & $streamlinkExe @slArgs 2>$null | Out-Host
                 } finally {
                     $ErrorActionPreference = $prevEap
                 }
