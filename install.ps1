@@ -1,4 +1,4 @@
-& {
+ {
     Set-StrictMode -Version Latest
     $ErrorActionPreference = 'Stop'
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -210,13 +210,14 @@
 
     # 3. Ana beti\u011fi (download.ps1) indir veya yerel kaynaktan kopyala
     $downloadPs1Target = Join-Path -Path $installRoot -ChildPath 'download.ps1'
-    $downloadPs1Url = "$repoRawBase/download.ps1"
+    $cacheBust = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $downloadPs1Url = "$repoRawBase/download.ps1?t=$cacheBust"
     $downloadedFromRemote = $false
 
     if (-not $env:VIDEODL_LOCAL_SOURCE) {
         $tempPs1 = Join-Path -Path $env:TEMP -ChildPath "videodl_script_$([guid]::NewGuid().ToString('N')).ps1"
         try {
-            Write-InstallMessage -Message "Ana betik indiriliyor: $downloadPs1Url" -Color Cyan
+            Write-InstallMessage -Message "Ana betik indiriliyor: $repoRawBase/download.ps1" -Color Cyan
             Invoke-WebRequest -Uri $downloadPs1Url -OutFile $tempPs1 -UseBasicParsing
             if ((Test-Path -LiteralPath $tempPs1) -and (Get-Item -LiteralPath $tempPs1).Length -gt 512) {
                 $rawContent = Get-Content -LiteralPath $tempPs1 -Raw -Encoding UTF8

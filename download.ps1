@@ -561,6 +561,19 @@ function Get-StandardResolutionTier {
             }
         }
     }
+    foreach ($fmt in $FormatGroup) {
+        if ($fmt.PSObject.Properties.Match('width').Count -gt 0 -and $null -ne $fmt.width -and [int]$fmt.width -gt $RawHeight) {
+            $w = [int]$fmt.width
+            if ($w -ge 3800) { return 2160 }
+            if ($w -ge 2500) { return 1440 }
+            if ($w -ge 1900) { return 1080 }
+            if ($w -ge 1200) { return 720 }
+            if ($w -ge 800)  { return 480 }
+            if ($w -ge 600)  { return 360 }
+            if ($w -ge 400)  { return 240 }
+            if ($w -ge 200)  { return 144 }
+        }
+    }
     return $RawHeight
 }
 
@@ -839,6 +852,8 @@ function Get-YtDlpArgumentList {
     $argList.Add('--windows-filenames')
     $argList.Add('--continue')
     $argList.Add('--no-update')
+    $argList.Add('--progress')
+    $argList.Add('--no-quiet')
 
     if ($IncludePlaylist) {
         $argList.Add('--yes-playlist')
@@ -1130,12 +1145,15 @@ function Invoke-VideoDlUpdate {
         New-Item -ItemType Directory -Path $script:InstallRoot -Force | Out-Null
     }
     $targetScript = Join-Path -Path $script:InstallRoot -ChildPath 'download.ps1'
-    $remoteScriptUrl = "$($script:RepoRawBaseUrl)/download.ps1"
+    $cacheBust = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $remoteScriptUrl = "$($script:RepoRawBaseUrl)/download.ps1?t=$cacheBust"
     $tempScript = Join-Path -Path $env:TEMP -ChildPath "videodl_update_$([guid]::NewGuid().ToString('N')).ps1"
     try {
         Invoke-WebRequest -Uri $remoteScriptUrl -OutFile $tempScript -UseBasicParsing
         if ((Get-Item -LiteralPath $tempScript).Length -gt 512) {
-            Copy-Item -LiteralPath $tempScript -Destination $targetScript -Force
+            $rawContent = (Get-Content -LiteralPath $tempScript -Raw -Encoding UTF8).TrimStart([char]0xFEFF)
+            $utf8Bom = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $true
+            [System.IO.File]::WriteAllText($targetScript, $rawContent, $utf8Bom)
             Write-Host 'download.ps1 başarıyla güncellendi.' -ForegroundColor Green
         }
     } catch {
@@ -1266,14 +1284,16 @@ function Invoke-VideoDownload {
         $targetUrl = Read-Host -Prompt 'URL'
         if (-not (Test-VideoUrl -InputUrl $targetUrl)) {
             Write-Host "Hata: Geçersiz URL adresi: '$targetUrl'. Lütfen http:// veya https:// ile başlayan geçerli bir bağlantı girin." -ForegroundColor Red
-            return 2
+            $script:ProcessExitCode = 2
+            return
         }
         $targetUrl = $targetUrl.Trim()
     }
 
     $deps = Assert-Dependencies -IsInteractive:$isInteractive
     if ($null -eq $deps) {
-        return 1
+        $script:ProcessExitCode = 1
+        return
     }
 
     $selectedQuality = $ResolvedParams.Quality
@@ -1285,7 +1305,8 @@ function Invoke-VideoDownload {
         Write-Host 'Video bilgileri alınıyor...' -ForegroundColor Cyan
         $videoInfo = Get-VideoMetadata -YtDlpPath $deps.YtDlpPath -TargetUrl $targetUrl -BrowserCookies $ResolvedParams.Cookies
         if ($null -eq $videoInfo) {
-            return 1
+            $script:ProcessExitCode = 1
+            return
         }
 
         $titleText = if ($videoInfo.PSObject.Properties.Match('title').Count -gt 0 -and -not [string]::IsNullOrWhiteSpace([string]$videoInfo.title)) { [string]$videoInfo.title } else { 'Bilinmeyen Başlık' }
@@ -1314,7 +1335,8 @@ function Invoke-VideoDownload {
             $parsedIdx = 0
             if (-not [int]::TryParse($choiceInput.Trim(), [ref]$parsedIdx) -or $parsedIdx -lt 1 -or $parsedIdx -gt $resolutions.Count) {
                 Write-Host "Hata: Geçersiz seçim '$choiceInput'." -ForegroundColor Red
-                return 2
+                $script:ProcessExitCode = 2
+                return
             }
             $choiceIdx = $parsedIdx
         }
@@ -1329,7 +1351,8 @@ function Invoke-VideoDownload {
                 $cleanFmt = $fmtPrompt.Trim().ToLowerInvariant()
                 if ($cleanFmt -notin $script:AudioFormats) {
                     Write-Host "Hata: Geçersiz ses formatı '$fmtPrompt'. Geçerli formatlar: $($script:AudioFormats -join ', ')." -ForegroundColor Red
-                    return 2
+                    $script:ProcessExitCode = 2
+                    return
                 }
                 $selectedFormat = $cleanFmt
             }
@@ -1342,7 +1365,8 @@ function Invoke-VideoDownload {
                 $cleanFmt = $fmtPrompt.Trim().ToLowerInvariant()
                 if ($cleanFmt -notin $script:AllowedFormats) {
                     Write-Host "Hata: Geçersiz format '$fmtPrompt'. Geçerli formatlar: $($script:AllowedFormats -join ', ')." -ForegroundColor Red
-                    return 2
+                    $script:ProcessExitCode = 2
+                    return
                 }
                 $selectedFormat = $cleanFmt
                 if ($selectedFormat -in $script:AudioFormats) {
@@ -1354,7 +1378,8 @@ function Invoke-VideoDownload {
         if ((-not $isAudioOnly) -and (-not $ResolvedParams.Playlist) -and ($selectedQuality -ne 'best')) {
             $videoInfo = Get-VideoMetadata -YtDlpPath $deps.YtDlpPath -TargetUrl $targetUrl -BrowserCookies $ResolvedParams.Cookies
             if ($null -eq $videoInfo) {
-                return 1
+                $script:ProcessExitCode = 1
+                return
             }
             $resolutions = @(Get-AvailableResolutions -VideoInfo $videoInfo)
             $effectiveSelection = Select-EffectiveQuality -RequestedQuality $selectedQuality -AvailableResolutions $resolutions
@@ -1392,7 +1417,7 @@ function Invoke-VideoDownload {
 
     try {
         $ErrorActionPreference = 'Continue'
-        & $deps.YtDlpPath @ytArgs 2>$errFile | Out-Host
+        & $deps.YtDlpPath @ytArgs 2>$errFile
         $dlExitCode = $LASTEXITCODE
         $downloadCompleted = $true
     } finally {
@@ -1418,7 +1443,8 @@ function Invoke-VideoDownload {
         if (Test-Path -LiteralPath $printFile) {
             Remove-Item -LiteralPath $printFile -Force -ErrorAction SilentlyContinue
         }
-        return 1
+        $script:ProcessExitCode = 1
+        return
     }
 
     $finalPath = $null
@@ -1458,7 +1484,7 @@ function Invoke-VideoDownload {
         }
     }
 
-    return 0
+    $script:ProcessExitCode = 0
 }
 
 function Invoke-Main {
@@ -1470,31 +1496,33 @@ function Invoke-Main {
 
     if (-not $ResolvedConfig.IsValid) {
         Write-Host $ResolvedConfig.ErrorMessage -ForegroundColor Red
-        return $ResolvedConfig.ExitCode
+        $script:ProcessExitCode = $ResolvedConfig.ExitCode
+        return
     }
 
     switch ($ResolvedConfig.Action) {
         'Help' {
             Show-HelpMessage
-            return 0
+            $script:ProcessExitCode = 0
         }
         'Update' {
-            return (Invoke-VideoDlUpdate)
+            $script:ProcessExitCode = Invoke-VideoDlUpdate
         }
         'Uninstall' {
-            return (Invoke-VideoDlUninstall)
+            $script:ProcessExitCode = Invoke-VideoDlUninstall
         }
         'Download' {
-            return (Invoke-VideoDownload -ResolvedParams $ResolvedConfig)
+            Invoke-VideoDownload -ResolvedParams $ResolvedConfig
         }
         default {
             Write-Host 'Hata: Bilinmeyen işlem türü.' -ForegroundColor Red
-            return 1
+            $script:ProcessExitCode = 1
         }
     }
 }
 
 if (-not $NoRun -and $MyInvocation.InvocationName -ne '.' -and $env:VIDEODL_LOAD_ONLY -ne '1') {
+    $script:ProcessExitCode = 0
     $cliConfig = Resolve-CliParameters `
         -InputUrl $Url `
         -InputQuality $Quality `
@@ -1508,6 +1536,6 @@ if (-not $NoRun -and $MyInvocation.InvocationName -ne '.' -and $env:VIDEODL_LOAD
         -InputUninstall:$Uninstall `
         -InputHelp:$Help `
         -InputRemainingArgs $RemainingArgs
-    $exitCode = Invoke-Main -ResolvedConfig $cliConfig
-    exit $exitCode
+    Invoke-Main -ResolvedConfig $cliConfig
+    exit $script:ProcessExitCode
 }
