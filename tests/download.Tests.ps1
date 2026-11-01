@@ -249,4 +249,80 @@ Describe 'VideoDL Unit Tests (download.ps1)' {
             (Convert-YtDlpErrorToTurkish -RawError 'ERROR: No space left on device') | Should -Match 'yeterli boş alan yok'
         }
     }
+
+    Context 'Katman 2-5 MediaFetch Akis Cikarimi ve Analiz Fonksiyonlari' {
+        It 'Dean Edwards (p,a,c,k,e,d) ile sikistirilmis JavaScript icinden m3u8 adresini cozer' {
+            $packedJs = @'
+eval(function(p,a,c,k,e,d){while(c--)if(k[c])p=p.replace(new RegExp('\b'+c.toString(a)+'\b','g'),k[c]);return p}('0.1({2:"3://4.5.6/7/8.9"});',10,10,'jwplayer|setup|file|https|cdn|ornekdizi|com|hls|master|m3u8'.split('|'),0,{}))
+'@
+            $unpacked = Expand-PackedJavaScript -Content $packedJs
+            $unpacked | Should -Match 'https://cdn\.ornekdizi\.com/hls/master\.m3u8'
+        }
+
+        It 'atob() ve Base64 ile sifrelenmis akis adreslerini decode eder' {
+            $b64Url = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes('https://stream.example.org/vod/index.m3u8?token=xyz987'))
+            $htmlWithB64 = "<script>var src = atob('$b64Url');</script>"
+            $decoded = Expand-Base64StringsInText -Content $htmlWithB64
+            $decoded | Should -Match 'https://stream\.example\.org/vod/index\.m3u8\?token=xyz987'
+        }
+
+        It 'Sayfa kaynagindan m3u8, mp4, iframe ve altyazi adreslerini eksiksiz ayiklar' {
+            $sampleHtml = @'
+<html>
+<head><title>Ornek Dizi 1. Bolum Izle</title></head>
+<body>
+  <iframe data-src="/embed/player123.html"></iframe>
+  <script>
+    var player = {
+      file: "https:\/\/cdn.site.com\/stream\/master.m3u8?token=abc\u0026expires=999",
+      backup: "https://cdn.site.com/video/bolum1.mp4",
+      sub: "https://cdn.site.com/subs/tr.vtt"
+    };
+  </script>
+</body>
+</html>
+'@
+            $res = Extract-StreamsAndIframesFromContent -Content $sampleHtml -PageUrl 'https://dizi.site.com/izle/bolum-1'
+            $res.PageTitle | Should -Be 'Ornek Dizi 1. Bolum Izle'
+            $res.IframeUrls.Count | Should -Be 1
+            $res.IframeUrls[0] | Should -Be 'https://dizi.site.com/embed/player123.html'
+            $res.Streams.Count | Should -Be 2
+            $res.Streams[0].StreamUrl | Should -Be 'https://cdn.site.com/stream/master.m3u8?token=abc&expires=999'
+            $res.Streams[0].HasToken | Should -BeTrue
+            $res.Streams[0].Referer | Should -Be 'https://dizi.site.com/izle/bolum-1'
+            $res.Subtitles.Count | Should -Be 1
+            $res.Subtitles[0] | Should -Be 'https://cdn.site.com/subs/tr.vtt'
+        }
+
+        It 'Katman 3 HLS manifest analizinde AES-128, DRM ve Master varyantlarini dogru tespit eder' {
+            $masterM3u8 = @'
+#EXTM3U
+#EXT-X-KEY:METHOD=AES-128,URI="keys/key.bin"
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
+720p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+1080p/index.m3u8
+'@
+            $info = Inspect-HlsManifestContent -ManifestText $masterM3u8 -ManifestUrl 'https://cdn.example.com/hls/master.m3u8'
+            $info.IsValidHls | Should -BeTrue
+            $info.IsMaster | Should -BeTrue
+            $info.IsAes128 | Should -BeTrue
+            $info.AesKeyUri | Should -Be 'https://cdn.example.com/hls/keys/key.bin'
+            $info.IsDrm | Should -BeFalse
+            $info.Variants.Count | Should -Be 2
+            $info.Variants[0].Height | Should -Be 1080
+            $info.Variants[0].Url | Should -Be 'https://cdn.example.com/hls/1080p/index.m3u8'
+
+            $drmM3u8 = "#EXTM3U`n#EXT-X-KEY:METHOD=SAMPLE-AES-CTR,KEYFORMAT=`"urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed`""
+            $drmInfo = Inspect-HlsManifestContent -ManifestText $drmM3u8 -ManifestUrl 'https://cdn.example.com/drm/master.m3u8'
+            $drmInfo.IsDrm | Should -BeTrue
+        }
+
+        It 'MediaFetch sonuc raporunu standart formatta uretir' {
+            $rep = Format-MediaFetchReport -Status 'Başarılı' -FilePathAndSize 'C:\Videos\test.mp4 (~20 MB)' -QualityAndCodec '1920x1080 (h264)' -StreamUrl 'https://cdn.example.com/master.m3u8' -WorkingLayer 'Katman 4' -Notes 'Sorunsuz indirildi'
+            $rep | Should -Match 'Durum: Başarılı'
+            $rep | Should -Match 'Katman 4'
+            $rep | Should -Match 'master\.m3u8'
+        }
+    }
 }

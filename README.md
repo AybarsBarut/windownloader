@@ -30,6 +30,29 @@ irm https://raw.githubusercontent.com/AybarsBarut/windownloader/main/install.ps1
 
 ---
 
+## Katmanlı Çözüm Stratejisi (MediaFetch 5-Katman Motoru)
+
+Standart video sitelerinin yanı sıra özel oynatıcı veya gömülü `iframe` kullanan dizi/film/video sayfalarında `download <url>` komutu durmadan sırasıyla 5 katmanı dener:
+
+1. **Katman 1 — Hazır Araçlarla Hızlı Deneme**:
+   - **1a**: Standart `yt-dlp` çıkarımı.
+   - **1b**: Başarısız olursa `--no-check-certificate`, `Referer`, `Origin` ve `User-Agent` başlıklarıyla ikinci deneme.
+2. **Katman 2 — Sayfa Kaynağı, İç İçe Iframe ve Gömülü Oynatıcı Analizi**:
+   - Sayfa kaynağını ve iç içe `iframe` zincirini (3 derinliğe kadar, üst sayfa `Referer` bilgisini koruyarak) tarar.
+   - Sıkıştırılmış JavaScript (`eval(function(p,a,c,k,e,d)...)`), Base64 (`atob(...)`) ve FirePlayer XHR (`do=getVideo`) yapılarını çözer.
+   - `.m3u8`, `.mp4`, `.mpd`, `manifest`, `playlist`, `master` akışlarını ve `.vtt`/`.srt` altyazıları yakalar; gerekirse Headless Tarayıcı (Edge/Chrome/Playwright) ile dinamik DOM ve ağ trafiğini inceler.
+3. **Katman 3 — Token, AES-128 HLS ve DRM Analizi**:
+   - İmzalı/token'lı akışların (`token=`, `expires=`, `sig=`, `hash=`) parametrelerini ve `Referer` başlığını korur.
+   - `#EXT-X-KEY:METHOD=AES-128` şifreli HLS akışlarını ve `#EXT-X-STREAM-INF` kalite varyantlarını tespit eder.
+   - İçerikte DRM (Widevine/FairPlay/SAMPLE-AES) varsa kullanıcıyı bilgilendirir ve bulunan akış/altyazı alternatiflerini raporlar.
+4. **Katman 4 — İndirme, Birleştirme ve `ffprobe` Doğrulama**:
+   - Yakalanan akışı sırasıyla `yt-dlp --hls-prefer-ffmpeg`, doğrudan `ffmpeg` (`-headers ... -c copy -bsf:a aac_adtstoasc`), `N_m3u8DL-RE` ve `streamlink` ile indirir.
+   - İndirilen dosyayı `ffprobe` ile doğrular (boyut, süre, codec, çözünürlük); bozuksa bir sonraki varyanta/akışa geçer.
+5. **Katman 5 — Derin Headless Yakalama ve Sonuç Raporu**:
+   - Her işlem sonunda durum, dosya yolu/boyutu, çözünürlük/codec, kullanılan akış URL'si ve çalışan katmanı içeren özet rapor sunar.
+
+---
+
 ## Kullanım
 
 ### Etkileşimli Mod

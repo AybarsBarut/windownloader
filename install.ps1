@@ -1,4 +1,5 @@
- {
+# VideoDL Installer
+& {
     Set-StrictMode -Version Latest
     $ErrorActionPreference = 'Stop'
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -75,7 +76,12 @@
     $forceDeps = ($env:VIDEODL_FORCE_DEPS -eq '1')
     $existingYtDlp = $null
     if (-not $forceDeps) {
-        $existingYtDlp = Get-Command -Name 'yt-dlp' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        $localYt = Join-Path -Path $binDir -ChildPath 'yt-dlp.exe'
+        if (Test-Path -LiteralPath $localYt -PathType Leaf) {
+            $existingYtDlp = [PSCustomObject]@{ Source = $localYt }
+        } else {
+            $existingYtDlp = Get-Command -Name 'yt-dlp' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        }
     }
 
     if ($null -ne $existingYtDlp -and -not [string]::IsNullOrWhiteSpace($existingYtDlp.Source)) {

@@ -849,8 +849,26 @@ function Get-YtDlpArgumentList {
         [Parameter(Mandatory = $false)]
         [string]$FfmpegPath,
 
+    [Parameter(Mandatory = $false)]
+        [string]$PrintFilePath,
+
         [Parameter(Mandatory = $false)]
-        [string]$PrintFilePath
+        [switch]$NoCheckCertificate,
+
+        [Parameter(Mandatory = $false)]
+        [string]$RefererUrl,
+
+        [Parameter(Mandatory = $false)]
+        [string]$OriginUrl,
+
+        [Parameter(Mandatory = $false)]
+        [string]$UserAgent,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$HlsPreferFfmpeg,
+
+        [Parameter(Mandatory = $false)]
+        [string]$CustomOutputTemplate
     )
 
     $argList = New-Object -TypeName System.Collections.Generic.List[string]
@@ -864,6 +882,29 @@ function Get-YtDlpArgumentList {
     $argList.Add('--no-update')
     $argList.Add('--progress')
     $argList.Add('--no-quiet')
+
+    if ($NoCheckCertificate) {
+        $argList.Add('--no-check-certificate')
+    }
+
+    if ($HlsPreferFfmpeg) {
+        $argList.Add('--hls-prefer-ffmpeg')
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($RefererUrl)) {
+        $argList.Add('--referer')
+        $argList.Add($RefererUrl.Trim())
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($UserAgent)) {
+        $argList.Add('--user-agent')
+        $argList.Add($UserAgent.Trim())
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($OriginUrl)) {
+        $argList.Add('--add-header')
+        $argList.Add("Origin:$($OriginUrl.Trim())")
+    }
 
     if ($IncludePlaylist) {
         $argList.Add('--yes-playlist')
@@ -894,7 +935,11 @@ function Get-YtDlpArgumentList {
         $argList.Add($PrintFilePath)
     }
 
-    $outputTemplate = Join-Path -Path $OutputDirectory -ChildPath '%(title).150B [%(id)s].%(ext)s'
+    $outputTemplate = if (-not [string]::IsNullOrWhiteSpace($CustomOutputTemplate)) {
+        $CustomOutputTemplate
+    } else {
+        Join-Path -Path $OutputDirectory -ChildPath '%(title).150B [%(id)s].%(ext)s'
+    }
     $argList.Add('-o')
     $argList.Add($outputTemplate)
     $argList.Add('--')
@@ -1214,6 +1259,1601 @@ function Invoke-VideoDlUninstall {
     return 0
 }
 
+$script:DefaultUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+$script:AltUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0'
+$script:LastYtDlpRawError = ''
+
+function Get-UrlOrigin {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$InputUrl
+    )
+    if ([string]::IsNullOrWhiteSpace($InputUrl)) {
+        return ''
+    }
+    $parsed = $null
+    if ([System.Uri]::TryCreate($InputUrl.Trim(), [System.UriKind]::Absolute, [ref]$parsed)) {
+        if ($parsed.IsDefaultPort) {
+            return "$($parsed.Scheme)://$($parsed.Host)"
+        }
+        return "$($parsed.Scheme)://$($parsed.Host):$($parsed.Port)"
+    }
+    return ''
+}
+
+function ConvertTo-SafeFileName {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$RawTitle
+    )
+    if ([string]::IsNullOrWhiteSpace($RawTitle)) {
+        return "video_$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
+    }
+    $decoded = [System.Net.WebUtility]::HtmlDecode($RawTitle).Trim()
+    $invalidChars = [System.IO.Path]::GetInvalidFileNameChars()
+    $sb = New-Object -TypeName System.Text.StringBuilder
+    foreach ($ch in $decoded.ToCharArray()) {
+        if ($invalidChars -contains $ch -or [int]$ch -lt 32) {
+            [void]$sb.Append('_')
+        } else {
+            [void]$sb.Append($ch)
+        }
+    }
+    $cleaned = ($sb.ToString() -replace '\s+', ' ' -replace '_{2,}', '_').Trim(' ', '.', '_')
+    if ([string]::IsNullOrWhiteSpace($cleaned)) {
+        return "video_$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
+    }
+    if ($cleaned.Length -gt 110) {
+        $cleaned = $cleaned.Substring(0, 110).Trim(' ', '.', '_')
+    }
+    return $cleaned
+}
+
+function ConvertFrom-EscapedMediaUrl {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$RawCandidate,
+
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$BaseUrl
+    )
+    if ([string]::IsNullOrWhiteSpace($RawCandidate)) {
+        return ''
+    }
+    $u = $RawCandidate.Trim().Trim('"', "'", '`', ' ', "`t", "`r", "`n")
+    $u = $u -replace '\\/', '/'
+    $u = $u -replace '\\u0026', '&'
+    $u = $u -replace '\\u002[fF]', '/'
+    $u = $u -replace '\\u003[aA]', ':'
+    $u = $u -replace '\\u003[dD]', '='
+    $u = $u -replace '\\u003[fF]', '?'
+    $u = $u -replace '\\x2[fF]', '/'
+    $u = $u -replace '\\x3[aA]', ':'
+    $u = $u -replace '\\x26', '&'
+    $u = $u -replace '&amp;', '&'
+    $u = $u.Trim()
+
+    if ([string]::IsNullOrWhiteSpace($u) -or $u -match '^(javascript:|data:|mailto:|about:|blob:|#)') {
+        return ''
+    }
+
+    if ($u.StartsWith('//')) {
+        $scheme = 'https:'
+        $baseUri = $null
+        if (-not [string]::IsNullOrWhiteSpace($BaseUrl) -and [System.Uri]::TryCreate($BaseUrl, [System.UriKind]::Absolute, [ref]$baseUri)) {
+            $scheme = "$($baseUri.Scheme):"
+        }
+        $u = "$scheme$u"
+    } elseif (-not ($u -match '^https?://')) {
+        $baseUri = $null
+        if (-not [string]::IsNullOrWhiteSpace($BaseUrl) -and [System.Uri]::TryCreate($BaseUrl, [System.UriKind]::Absolute, [ref]$baseUri)) {
+            $resolved = $null
+            if ([System.Uri]::TryCreate($baseUri, $u, [ref]$resolved)) {
+                $u = $resolved.AbsoluteUri
+            } else {
+                return ''
+            }
+        } else {
+            return ''
+        }
+    }
+
+    $finalUri = $null
+    if ([System.Uri]::TryCreate($u, [System.UriKind]::Absolute, [ref]$finalUri) -and $finalUri.Scheme -in @('http', 'https')) {
+        return $finalUri.AbsoluteUri
+    }
+    return ''
+}
+
+function ConvertFrom-BaseNToken {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Token,
+
+        [Parameter(Mandatory = $true)]
+        [int]$Radix
+    )
+    if ($Radix -lt 2 -or $Radix -gt 62 -or [string]::IsNullOrEmpty($Token)) {
+        return -1
+    }
+    $result = 0
+    foreach ($ch in $Token.ToCharArray()) {
+        $code = [int]$ch
+        $digit = -1
+        if ($code -ge 48 -and $code -le 57) {
+            $digit = $code - 48
+        } elseif ($code -ge 97 -and $code -le 122) {
+            $digit = ($code - 97) + 10
+        } elseif ($code -ge 65 -and $code -le 90) {
+            $digit = ($code - 65) + 36
+        }
+        if ($digit -lt 0 -or $digit -ge $Radix) {
+            return -1
+        }
+        $result = ($result * $Radix) + $digit
+    }
+    return $result
+}
+
+function Expand-PackedJavaScript {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$Content
+    )
+    if ([string]::IsNullOrWhiteSpace($Content) -or $Content -notmatch 'eval\s*\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,\s*k') {
+        return ''
+    }
+
+    $unpackedBlocks = New-Object -TypeName System.Collections.Generic.List[string]
+    $pattern = "(?s)eval\s*\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,\s*k\s*,\s*e\s*,\s*[dr]\s*\)\s*\{.*?\}\s*\(\s*(?<q1>['`"])(?<p>(?:\\.|(?!\k<q1>).)*)\k<q1>\s*,\s*(?<a>\d+)\s*,\s*(?<c>\d+)\s*,\s*(?<q2>['`"])(?<k>(?:\\.|(?!\k<q2>).)*)\k<q2>\s*\.split\(\s*['`"]\|['`"]\s*\)"
+    $matchesList = [regex]::Matches($Content, $pattern)
+
+    foreach ($m in $matchesList) {
+        $payload = $m.Groups['p'].Value
+        $radix = 0
+        if (-not [int]::TryParse($m.Groups['a'].Value, [ref]$radix) -or $radix -lt 2 -or $radix -gt 62) {
+            continue
+        }
+        $symTable = $m.Groups['k'].Value -split '\|'
+        $expanded = [regex]::Replace($payload, '\b[0-9a-zA-Z]+\b', {
+            param($wordMatch)
+            $token = $wordMatch.Value
+            $idx = ConvertFrom-BaseNToken -Token $token -Radix $radix
+            if ($idx -ge 0 -and $idx -lt $symTable.Count -and -not [string]::IsNullOrEmpty($symTable[$idx])) {
+                return $symTable[$idx]
+            }
+            return $token
+        })
+        $expanded = $expanded -replace "\\'", "'" -replace '\\"', '"'
+        $unpackedBlocks.Add($expanded)
+    }
+
+    return ($unpackedBlocks -join "`n")
+}
+
+function Expand-Base64StringsInText {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$Content
+    )
+    if ([string]::IsNullOrWhiteSpace($Content)) {
+        return ''
+    }
+
+    $decodedBlocks = New-Object -TypeName System.Collections.Generic.List[string]
+    $b64Patterns = @(
+        'atob\(\s*["''](?<b64>[A-Za-z0-9+/=_-]{16,})["'']\s*\)',
+        'Base64\.decode\(\s*["''](?<b64>[A-Za-z0-9+/=_-]{16,})["'']\s*\)',
+        '["''](?<b64>aHR0c[A-Za-z0-9+/=_-]{12,})["'']'
+    )
+
+    foreach ($pat in $b64Patterns) {
+        $mList = [regex]::Matches($Content, $pat)
+        foreach ($m in $mList) {
+            $rawB64 = $m.Groups['b64'].Value.Trim().Replace('-', '+').Replace('_', '/')
+            $mod = $rawB64.Length % 4
+            if ($mod -eq 2) { $rawB64 += '==' }
+            elseif ($mod -eq 3) { $rawB64 += '=' }
+            elseif ($mod -eq 1) { continue }
+
+            try {
+                $bytes = [System.Convert]::FromBase64String($rawB64)
+                $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+                if ($text -match '(https?://|\.m3u8|\.mp4|\.mpd|manifest|playlist|master|/embed/|/player/)') {
+                    $decodedBlocks.Add($text)
+                }
+            } catch {
+                continue
+            }
+        }
+    }
+
+    return ($decodedBlocks -join "`n")
+}
+
+function Test-StreamHasAuthToken {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$StreamUrl
+    )
+    if ([string]::IsNullOrWhiteSpace($StreamUrl)) {
+        return $false
+    }
+    return [bool]($StreamUrl -match '(?i)([?&](token|expires|exp|sig|signature|hash|md5|tms|hdnea|wmsAuthSign|Policy|Key-Pair-Id|auth|st|e)=)')
+}
+
+function Test-IsLikelyMediaStreamUrl {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$CandidateUrl
+    )
+    if ([string]::IsNullOrWhiteSpace($CandidateUrl)) {
+        return $false
+    }
+    if ($CandidateUrl -match '(?i)\.(js|css|png|jpg|jpeg|gif|svg|webp|ico|woff2?|ttf|eot|json|xml|html?|php|asp|aspx)(\?|$)') {
+        if ($CandidateUrl -notmatch '(?i)(m3u8|mp4|mpd|manifest|master|playlist)') {
+            return $false
+        }
+    }
+    if ($CandidateUrl -match '(?i)(google-analytics|googletagmanager|doubleclick|facebook\.com/tr|yandex|histats|cloudflareinsights|adsystem|adservice|fontawesome|jquery|bootstrap)') {
+        return $false
+    }
+    return [bool]($CandidateUrl -match '(?i)(\.m3u8(\b|\?|$)|\.mp4(\b|\?|$)|\.mpd(\b|\?|$)|/(manifest|playlist|master|hls|stream)[^"''\s]*(\.m3u8|\.mp4|\.txt|\?))')
+}
+
+function Extract-StreamsAndIframesFromContent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$Content,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PageUrl,
+
+        [Parameter(Mandatory = $false)]
+        [string]$SourceLabel = 'Katman 2 (Sayfa Kaynağı)'
+    )
+
+    $streams = New-Object -TypeName System.Collections.Generic.List[object]
+    $iframes = New-Object -TypeName System.Collections.Generic.List[string]
+    $subtitles = New-Object -TypeName System.Collections.Generic.List[string]
+    $seenStreams = New-Object -TypeName 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
+    $seenIframes = New-Object -TypeName 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
+
+    if ([string]::IsNullOrWhiteSpace($Content)) {
+        return [PSCustomObject]@{
+            PageTitle   = ''
+            Streams     = @()
+            IframeUrls  = @()
+            Subtitles   = @()
+            HasDrmHint  = $false
+            DrmDetails  = ''
+        }
+    }
+
+    $pageTitle = ''
+    if ($Content -match '(?is)<meta\s+[^>]*property=["'']og:title["''][^>]*content=["''](?<t>[^"'']+)["'']') {
+        $pageTitle = $Matches['t'].Trim()
+    } elseif ($Content -match '(?is)<title[^>]*>(?<t>.*?)</title>') {
+        $pageTitle = ($Matches['t'] -replace '\s+', ' ').Trim()
+    }
+
+    $hasDrmHint = $false
+    $drmDetails = ''
+    if ($Content -match '(?i)(urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed|com\.widevine\.alpha|com\.apple\.fps|com\.microsoft\.playready|#EXT-X-KEY:METHOD=SAMPLE-AES|<ContentProtection[^>]+cenc:pssh)') {
+        $hasDrmHint = $true
+        $drmDetails = $Matches[0]
+    }
+
+    $unpackedJs = Expand-PackedJavaScript -Content $Content
+    $decodedB64 = Expand-Base64StringsInText -Content ($Content + "`n" + $unpackedJs)
+
+    $segmentsToScan = @(
+        [PSCustomObject]@{ Text = $Content;    Method = "$SourceLabel - Regex" },
+        [PSCustomObject]@{ Text = $unpackedJs; Method = 'Katman 2d (Packed JS Çözücü)' },
+        [PSCustomObject]@{ Text = $decodedB64; Method = 'Katman 2e (Base64 Decode)' }
+    )
+
+    $originUrl = Get-UrlOrigin -InputUrl $PageUrl
+
+    $streamRegexList = @(
+        '["''](?<u>https?:(?:\\/|/){2}[^"''\s<>]+?\.m3u8[^"''\s<>]*)["'']',
+        '["''](?<u>https?:(?:\\/|/){2}[^"''\s<>]+?\.mp4[^"''\s<>]*)["'']',
+        '["''](?<u>https?:(?:\\/|/){2}[^"''\s<>]+?\.mpd[^"''\s<>]*)["'']',
+        '["''](?<u>https?:(?:\\/|/){2}[^"''\s<>]+?\.(?:vtt|srt)[^"''\s<>]*)["'']',
+        '["''](?<u>https?:(?:\\/|/){2}[^"''\s<>]+?(?:manifest|playlist|master)\.(?:m3u8|txt|json)[^"''\s<>]*)["'']',
+        '(?i)(?:file|source|src|video_url|stream_url|hls_url|hlsUrl|videoUrl|streamUrl|manifestUrl|masterUrl|contentUrl|subtitle|sub)\s*[:=]\s*["''](?<u>[^"''\s<>]+)["'']',
+        '(?i)hls\.loadSource\(\s*["''](?<u>[^"''\s<>]+)["'']\s*\)',
+        '(?i)<source\s+[^>]*src=["''](?<u>[^"''\s<>]+)["'']',
+        '(?i)<track\s+[^>]*src=["''](?<u>[^"''\s<>]+)["'']',
+        '(?i)<video\s+[^>]*src=["''](?<u>[^"''\s<>]+)["'']'
+    )
+
+    foreach ($seg in $segmentsToScan) {
+        if ([string]::IsNullOrWhiteSpace($seg.Text)) {
+            continue
+        }
+        foreach ($rx in $streamRegexList) {
+            $mCol = [regex]::Matches($seg.Text, $rx)
+            foreach ($m in $mCol) {
+                $rawU = $m.Groups['u'].Value
+                $cleanU = ConvertFrom-EscapedMediaUrl -RawCandidate $rawU -BaseUrl $PageUrl
+                if ([string]::IsNullOrWhiteSpace($cleanU)) {
+                    continue
+                }
+                if ($cleanU -match '(?i)\.(vtt|srt)(\?|$)') {
+                    if (-not $subtitles.Contains($cleanU)) {
+                        $subtitles.Add($cleanU)
+                    }
+                    continue
+                }
+                if (-not (Test-IsLikelyMediaStreamUrl -CandidateUrl $cleanU)) {
+                    continue
+                }
+                if ($seenStreams.Add($cleanU)) {
+                    $sType = if ($cleanU -match '(?i)\.m3u8|(manifest|playlist|master)\.(txt|m3u8)') {
+                        'm3u8'
+                    } elseif ($cleanU -match '(?i)\.mpd(\b|\?|$)') {
+                        'mpd'
+                    } else {
+                        'mp4'
+                    }
+                    $streams.Add([PSCustomObject]@{
+                        StreamUrl      = $cleanU
+                        StreamType     = $sType
+                        Referer        = $PageUrl
+                        Origin         = $originUrl
+                        HasToken       = (Test-StreamHasAuthToken -StreamUrl $cleanU)
+                        DiscoveryLayer = $seg.Method
+                        IsAes128       = $false
+                        IsDrm          = $false
+                    })
+                }
+            }
+        }
+    }
+
+    $iframeRegexList = @(
+        '(?is)<iframe\s+[^>]*?(?:data-litespeed-src|data-lazy-src|data-src|src)\s*=\s*["''](?<u>[^"''\s<>]+)["'']',
+        '(?i)(?:data-frame|data-embed|data-player|embed_url|iframe_url|player_url)\s*[:=]\s*["''](?<u>(?:https?:)?//[^"''\s<>]+|/[^"''\s<>]+)["'']'
+    )
+
+    $combinedForIframes = $Content + "`n" + $unpackedJs + "`n" + $decodedB64
+    foreach ($irx in $iframeRegexList) {
+        $imCol = [regex]::Matches($combinedForIframes, $irx)
+        foreach ($im in $imCol) {
+            $rawIf = $im.Groups['u'].Value
+            $cleanIf = ConvertFrom-EscapedMediaUrl -RawCandidate $rawIf -BaseUrl $PageUrl
+            if ([string]::IsNullOrWhiteSpace($cleanIf)) {
+                continue
+            }
+            if ($cleanIf -match '(?i)(googletagmanager|google\.com/recaptcha|facebook\.com/plugins|disqus\.com|doubleclick|youtube\.com/subscribe_embed|about:blank)') {
+                continue
+            }
+            if ($seenIframes.Add($cleanIf)) {
+                $iframes.Add($cleanIf)
+            }
+        }
+    }
+
+    return [PSCustomObject]@{
+        PageTitle   = $pageTitle
+        Streams     = $streams.ToArray()
+        IframeUrls  = $iframes.ToArray()
+        Subtitles   = $subtitles.ToArray()
+        HasDrmHint  = $hasDrmHint
+        DrmDetails  = $drmDetails
+    }
+}
+
+function Invoke-WebPageFetch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetUrl,
+
+        [Parameter(Mandatory = $false)]
+        [string]$RefererUrl = '',
+
+        [Parameter(Mandatory = $false)]
+        [string]$UserAgent = $script:DefaultUserAgent,
+
+        [Parameter(Mandatory = $false)]
+        [int]$TimeoutSeconds = 18
+    )
+
+    $originUrl = if (-not [string]::IsNullOrWhiteSpace($RefererUrl)) { Get-UrlOrigin -InputUrl $RefererUrl } else { Get-UrlOrigin -InputUrl $TargetUrl }
+    $curlExe = Join-Path -Path $env:SystemRoot -ChildPath 'System32\curl.exe'
+    if (Test-Path -LiteralPath $curlExe -PathType Leaf) {
+        $curlArgs = New-Object -TypeName System.Collections.Generic.List[string]
+        $curlArgs.Add('-s')
+        $curlArgs.Add('-L')
+        $curlArgs.Add('-k')
+        $curlArgs.Add('--compressed')
+        $curlArgs.Add('--max-time')
+        $curlArgs.Add([string]$TimeoutSeconds)
+        $curlArgs.Add('-A')
+        $curlArgs.Add($UserAgent)
+        $curlArgs.Add('-H')
+        $curlArgs.Add('Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8')
+        $curlArgs.Add('-H')
+        $curlArgs.Add('Accept-Language: tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7')
+        if (-not [string]::IsNullOrWhiteSpace($RefererUrl)) {
+            $curlArgs.Add('-e')
+            $curlArgs.Add($RefererUrl)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($originUrl)) {
+            $curlArgs.Add('-H')
+            $curlArgs.Add("Origin: $originUrl")
+        }
+        $curlArgs.Add($TargetUrl)
+
+        $prevEap = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $curlArgsArr = $curlArgs.ToArray()
+            $rawLines = & $curlExe @curlArgsArr 2>$null
+            if ($LASTEXITCODE -eq 0 -and $null -ne $rawLines) {
+                $joined = ($rawLines -join "`n").Trim()
+                if (-not [string]::IsNullOrWhiteSpace($joined) -and $joined -notmatch '(?i)(<title>Just a moment\.\.\.</title>|cf-browser-verification)') {
+                    return $joined
+                }
+            }
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
+    }
+
+    # Cloudflare TLS parmak izi engeli varsa Python curl_cffi ile Chrome TLS impersonation dene
+    $pyCmd = Get-Command -Name 'python' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $pyCmd -and -not [string]::IsNullOrWhiteSpace($pyCmd.Source)) {
+        $prevEap = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $pyInline = "import sys; from curl_cffi import requests; r=requests.get(sys.argv[1], headers={'Referer': sys.argv[2]} if sys.argv[2] else {}, impersonate='chrome', verify=False, timeout=15); sys.stdout.buffer.write(r.content)"
+            $cfLines = & $pyCmd.Source -c $pyInline $TargetUrl $RefererUrl 2>$null
+            if ($LASTEXITCODE -eq 0 -and $null -ne $cfLines) {
+                $cfJoined = ($cfLines -join "`n").Trim()
+                if (-not [string]::IsNullOrWhiteSpace($cfJoined)) {
+                    return $cfJoined
+                }
+            }
+        } catch {
+            Write-Verbose "curl_cffi yedek isteği başarısız: $($_.Exception.Message)"
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
+    }
+
+    try {
+        $headers = @{
+            'Accept'          = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+            'Accept-Language' = 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7'
+        }
+        if (-not [string]::IsNullOrWhiteSpace($RefererUrl)) {
+            $headers['Referer'] = $RefererUrl
+        }
+        if (-not [string]::IsNullOrWhiteSpace($originUrl)) {
+            $headers['Origin'] = $originUrl
+        }
+        $resp = Invoke-WebRequest -Uri $TargetUrl -UserAgent $UserAgent -Headers $headers -TimeoutSec $TimeoutSeconds -UseBasicParsing -ErrorAction Stop
+        if ($null -ne $resp -and -not [string]::IsNullOrWhiteSpace($resp.Content)) {
+            return [string]$resp.Content
+        }
+    } catch {
+        Write-Verbose "Invoke-WebPageFetch hatası ($TargetUrl): $($_.Exception.Message)"
+    }
+    return ''
+}
+
+function Resolve-HeadlessBrowserPath {
+    [CmdletBinding()]
+    param()
+    $candidates = @(
+        "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
+        "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+        "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+        "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+    )
+    foreach ($path in $candidates) {
+        if (-not [string]::IsNullOrWhiteSpace($path) -and (Test-Path -LiteralPath $path -PathType Leaf)) {
+            return $path
+        }
+    }
+    $cmd = Get-Command -Name @('msedge', 'chrome') -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $cmd -and -not [string]::IsNullOrWhiteSpace($cmd.Source)) {
+        return $cmd.Source
+    }
+    return $null
+}
+
+function Invoke-FirePlayerApiCheck {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$Content,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PageUrl,
+
+        [Parameter(Mandatory = $false)]
+        [string]$ParentReferer = ''
+    )
+
+    $results = New-Object -TypeName System.Collections.Generic.List[object]
+    $hashVal = ''
+    if ($PageUrl -match '(?i)/player/index\.php\?data=(?<h>[a-f0-9]{16,64})') {
+        $hashVal = $Matches['h']
+    } elseif (-not [string]::IsNullOrWhiteSpace($Content) -and $Content -match '(?i)FirePlayer\(\s*["''](?<h>[a-f0-9]{16,64})["'']') {
+        $hashVal = $Matches['h']
+    }
+
+    if ([string]::IsNullOrWhiteSpace($hashVal)) {
+        return @()
+    }
+
+    $origin = Get-UrlOrigin -InputUrl $PageUrl
+    if ([string]::IsNullOrWhiteSpace($origin)) {
+        return @()
+    }
+
+    $apiUrl = "$origin/player/index.php?data=$hashVal&do=getVideo"
+    $refToSend = if (-not [string]::IsNullOrWhiteSpace($ParentReferer)) { $ParentReferer } else { $PageUrl }
+    $curlExe = Join-Path -Path $env:SystemRoot -ChildPath 'System32\curl.exe'
+    $jsonResp = ''
+
+    if (Test-Path -LiteralPath $curlExe -PathType Leaf) {
+        $cArgs = @(
+            '-s', '-L', '-k', '--max-time', '15',
+            '-X', 'POST',
+            '-A', $script:DefaultUserAgent,
+            '-e', $PageUrl,
+            '-H', "Origin: $origin",
+            '-H', 'X-Requested-With: XMLHttpRequest',
+            '-H', 'Content-Type: application/x-www-form-urlencoded; charset=UTF-8',
+            '--data-raw', "hash=$hashVal&r=$([System.Uri]::EscapeDataString($refToSend))",
+            $apiUrl
+        )
+        $prevEap = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $lines = & $curlExe @cArgs 2>$null
+            if ($null -ne $lines) {
+                $jsonResp = ($lines -join "`n").Trim()
+            }
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($jsonResp)) {
+        foreach ($field in @('securedLink', 'videoSource')) {
+            if ($jsonResp -match "`"$field`"\s*:\s*`"(?<u>[^`"]+)`"") {
+                $cleanU = ConvertFrom-EscapedMediaUrl -RawCandidate $Matches['u'] -BaseUrl $PageUrl
+                if (-not [string]::IsNullOrWhiteSpace($cleanU)) {
+                    $results.Add([PSCustomObject]@{
+                        StreamUrl      = $cleanU
+                        StreamType     = 'm3u8'
+                        Referer        = $PageUrl
+                        Origin         = $origin
+                        HasToken       = (Test-StreamHasAuthToken -StreamUrl $cleanU)
+                        DiscoveryLayer = 'Katman 2d (FirePlayer XHR API)'
+                        IsAes128       = $false
+                        IsDrm          = $false
+                    })
+                }
+            }
+        }
+    }
+
+    return $results.ToArray()
+}
+
+function Invoke-HeadlessDomCapture {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetUrl,
+
+        [Parameter(Mandatory = $false)]
+        [int]$WaitBudgetMs = 6000
+    )
+
+    # 1. Python Playwright varsa network trafiğini (m3u8/mp4/manifest) ve DOM'u yakala
+    $pyCmd = Get-Command -Name 'python' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $pyCmd -and -not [string]::IsNullOrWhiteSpace($pyCmd.Source)) {
+        $pyScript = @"
+import sys
+try:
+    from playwright.sync_api import sync_playwright
+except Exception:
+    sys.exit(2)
+
+url = sys.argv[1]
+wait_ms = int(sys.argv[2])
+captured = []
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    context = browser.new_context(ignore_https_errors=True)
+    page = context.new_page()
+    def on_req(req):
+        u = req.url
+        if any(k in u.lower() for k in ['.m3u8', '.mp4', '.mpd', 'manifest', 'playlist', 'master']):
+            captured.append(u)
+    page.on('request', on_req)
+    try:
+        page.goto(url, wait_until='domcontentloaded', timeout=15000)
+        page.wait_for_timeout(wait_ms)
+    except Exception:
+        pass
+    html = page.content()
+    browser.close()
+
+for c in captured:
+    print(f'<!-- MEDIAFETCH_NET_STREAM: "{c}" -->')
+print(html)
+"@
+        $tempPy = Join-Path -Path $env:TEMP -ChildPath "videodl_pw_$([guid]::NewGuid().ToString('N')).py"
+        $prevEap = $ErrorActionPreference
+        try {
+            [System.IO.File]::WriteAllText($tempPy, $pyScript, [System.Text.Encoding]::UTF8)
+            $ErrorActionPreference = 'Continue'
+            $pwLines = & $pyCmd.Source $tempPy $TargetUrl $WaitBudgetMs 2>$null
+            if ($LASTEXITCODE -eq 0 -and $null -ne $pwLines) {
+                $pwOut = ($pwLines -join "`n").Trim()
+                if (-not [string]::IsNullOrWhiteSpace($pwOut)) {
+                    return $pwOut
+                }
+            }
+        } catch {
+            Write-Verbose "Playwright yakalama hatası: $($_.Exception.Message)"
+        } finally {
+            $ErrorActionPreference = $prevEap
+            if (Test-Path -LiteralPath $tempPy) {
+                Remove-Item -LiteralPath $tempPy -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    # 2. Yerel Edge / Chrome Headless (--dump-dom + --log-net-log)
+    $browserExe = Resolve-HeadlessBrowserPath
+    if ([string]::IsNullOrWhiteSpace($browserExe)) {
+        return ''
+    }
+
+    $netLogFile = Join-Path -Path $env:TEMP -ChildPath "videodl_netlog_$([guid]::NewGuid().ToString('N')).json"
+    $browserArgs = @(
+        '--headless=new',
+        '--disable-gpu',
+        '--no-sandbox',
+        '--ignore-certificate-errors',
+        '--autoplay-policy=no-user-gesture-required',
+        "--user-agent=$script:DefaultUserAgent",
+        "--log-net-log=$netLogFile",
+        "--virtual-time-budget=$WaitBudgetMs",
+        '--dump-dom',
+        $TargetUrl
+    )
+
+    $prevEap = $ErrorActionPreference
+    $combinedOut = ''
+    try {
+        $ErrorActionPreference = 'Continue'
+        $domLines = & $browserExe @browserArgs 2>$null
+        if ($null -ne $domLines) {
+            $combinedOut = ($domLines -join "`n").Trim()
+        }
+        if (Test-Path -LiteralPath $netLogFile) {
+            $netRaw = Get-Content -LiteralPath $netLogFile -Raw -ErrorAction SilentlyContinue
+            if (-not [string]::IsNullOrWhiteSpace($netRaw)) {
+                $combinedOut = $combinedOut + "`n" + $netRaw
+            }
+        }
+    } catch {
+        Write-Verbose "Headless tarayıcı DOM yakalama hatası: $($_.Exception.Message)"
+    } finally {
+        $ErrorActionPreference = $prevEap
+        if (Test-Path -LiteralPath $netLogFile) {
+            Remove-Item -LiteralPath $netLogFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+    return $combinedOut
+}
+
+function Invoke-Layer2PageAnalysis {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetUrl,
+
+        [Parameter(Mandatory = $false)]
+        [int]$MaxIframeDepth = 3,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$UseHeadlessBrowser
+    )
+
+    $allStreams = New-Object -TypeName System.Collections.Generic.List[object]
+    $allSubtitles = New-Object -TypeName System.Collections.Generic.List[string]
+    $allIframes = New-Object -TypeName System.Collections.Generic.List[string]
+    $seenStreamUrls = New-Object -TypeName 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
+    $visitedPages = New-Object -TypeName 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
+    $bestTitle = ''
+    $drmDetected = $false
+    $drmNote = ''
+
+    $queue = New-Object -TypeName System.Collections.Generic.Queue[object]
+    $queue.Enqueue([PSCustomObject]@{
+        Url     = $TargetUrl
+        Referer = (Get-UrlOrigin -InputUrl $TargetUrl)
+        Depth   = 0
+    })
+
+    while ($queue.Count -gt 0) {
+        $current = $queue.Dequeue()
+        if (-not $visitedPages.Add($current.Url)) {
+            continue
+        }
+
+        $label = if ($current.Depth -eq 0) { 'Katman 2b/2d (Ana Sayfa Kaynağı)' } else { "Katman 2c (Iframe Derinlik $($current.Depth))" }
+        Write-Host "  -> [$label] İnceleniyor: $($current.Url)" -ForegroundColor DarkCyan
+
+        $html = Invoke-WebPageFetch -TargetUrl $current.Url -RefererUrl $current.Referer -UserAgent $script:DefaultUserAgent
+        if ([string]::IsNullOrWhiteSpace($html)) {
+            $html = Invoke-WebPageFetch -TargetUrl $current.Url -RefererUrl $current.Referer -UserAgent $script:AltUserAgent
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($html)) {
+            $extracted = Extract-StreamsAndIframesFromContent -Content $html -PageUrl $current.Url -SourceLabel $label
+            if ([string]::IsNullOrWhiteSpace($bestTitle) -and -not [string]::IsNullOrWhiteSpace($extracted.PageTitle)) {
+                $bestTitle = $extracted.PageTitle
+            }
+            if ($extracted.HasDrmHint) {
+                $drmDetected = $true
+                $drmNote = $extracted.DrmDetails
+            }
+            foreach ($s in $extracted.Streams) {
+                if ($seenStreamUrls.Add($s.StreamUrl)) {
+                    $allStreams.Add($s)
+                }
+            }
+            $fpStreams = @(Invoke-FirePlayerApiCheck -Content $html -PageUrl $current.Url -ParentReferer $current.Referer)
+            foreach ($fps in $fpStreams) {
+                if ($seenStreamUrls.Add($fps.StreamUrl)) {
+                    $allStreams.Add($fps)
+                }
+            }
+            foreach ($sub in $extracted.Subtitles) {
+                if (-not $allSubtitles.Contains($sub)) {
+                    $allSubtitles.Add($sub)
+                }
+            }
+            foreach ($ifUrl in $extracted.IframeUrls) {
+                if (-not $allIframes.Contains($ifUrl)) {
+                    $allIframes.Add($ifUrl)
+                }
+                if ($current.Depth -lt $MaxIframeDepth -and -not $visitedPages.Contains($ifUrl)) {
+                    $queue.Enqueue([PSCustomObject]@{
+                        Url     = $ifUrl
+                        Referer = $current.Url
+                        Depth   = $current.Depth + 1
+                    })
+                }
+            }
+        }
+    }
+
+    if (($UseHeadlessBrowser -or $allStreams.Count -eq 0) -and $null -ne (Resolve-HeadlessBrowserPath)) {
+        Write-Host '  -> [Katman 2a] Headless tarayıcı ile dinamik DOM ve oynatıcı kaynakları taranıyor...' -ForegroundColor Cyan
+        $domHtml = Invoke-HeadlessDomCapture -TargetUrl $TargetUrl -WaitBudgetMs 6500
+        if (-not [string]::IsNullOrWhiteSpace($domHtml)) {
+            $domExtracted = Extract-StreamsAndIframesFromContent -Content $domHtml -PageUrl $TargetUrl -SourceLabel 'Katman 2a (Headless Browser DOM)'
+            if ([string]::IsNullOrWhiteSpace($bestTitle) -and -not [string]::IsNullOrWhiteSpace($domExtracted.PageTitle)) {
+                $bestTitle = $domExtracted.PageTitle
+            }
+            if ($domExtracted.HasDrmHint) {
+                $drmDetected = $true
+                $drmNote = $domExtracted.DrmDetails
+            }
+            foreach ($s in $domExtracted.Streams) {
+                if ($seenStreamUrls.Add($s.StreamUrl)) {
+                    $allStreams.Add($s)
+                }
+            }
+            foreach ($sub in $domExtracted.Subtitles) {
+                if (-not $allSubtitles.Contains($sub)) {
+                    $allSubtitles.Add($sub)
+                }
+            }
+            foreach ($ifUrl in $domExtracted.IframeUrls) {
+                if (-not $allIframes.Contains($ifUrl)) {
+                    $allIframes.Add($ifUrl)
+                }
+                if (-not $visitedPages.Contains($ifUrl)) {
+                    Write-Host "  -> [Katman 2a/2c] Headless DOM içinde bulunan iframe inceleniyor: $ifUrl" -ForegroundColor DarkCyan
+                    $ifHtml = Invoke-WebPageFetch -TargetUrl $ifUrl -RefererUrl $TargetUrl -UserAgent $script:DefaultUserAgent
+                    if ([string]::IsNullOrWhiteSpace($ifHtml)) {
+                        $ifHtml = Invoke-HeadlessDomCapture -TargetUrl $ifUrl -WaitBudgetMs 5500
+                    }
+                    if (-not [string]::IsNullOrWhiteSpace($ifHtml)) {
+                        $ifExt = Extract-StreamsAndIframesFromContent -Content $ifHtml -PageUrl $ifUrl -SourceLabel 'Katman 2a/2c (Headless Iframe)'
+                        foreach ($s in $ifExt.Streams) {
+                            if ($seenStreamUrls.Add($s.StreamUrl)) {
+                                $allStreams.Add($s)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return [PSCustomObject]@{
+        PageTitle   = $bestTitle
+        Streams     = $allStreams.ToArray()
+        IframeUrls  = $allIframes.ToArray()
+        Subtitles   = $allSubtitles.ToArray()
+        HasDrmHint  = $drmDetected
+        DrmDetails  = $drmNote
+    }
+}
+
+function Inspect-HlsManifestContent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$ManifestText,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ManifestUrl
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ManifestText) -or $ManifestText -notmatch '#EXTM3U') {
+        return [PSCustomObject]@{
+            IsValidHls = $false
+            IsMaster   = $false
+            IsAes128   = $false
+            AesKeyUri  = ''
+            IsDrm      = $false
+            DrmMethod  = ''
+            Variants   = @()
+        }
+    }
+
+    $isAes128 = $false
+    $aesKeyUri = ''
+    if ($ManifestText -match '#EXT-X-KEY:[^\r\n]*METHOD=AES-128(?:[^\r\n]*URI=["''](?<k>[^"'']+)["''])?') {
+        $isAes128 = $true
+        if ($Matches['k']) {
+            $aesKeyUri = ConvertFrom-EscapedMediaUrl -RawCandidate $Matches['k'] -BaseUrl $ManifestUrl
+        }
+    }
+
+    $isDrm = $false
+    $drmMethod = ''
+    if ($ManifestText -match '(?i)#EXT-X-KEY:[^\r\n]*METHOD=(?<m>SAMPLE-AES|SAMPLE-AES-CTR|SAMPLE-AES-CENC)') {
+        $isDrm = $true
+        $drmMethod = $Matches['m']
+    } elseif ($ManifestText -match '(?i)(urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed|com\.widevine\.alpha|com\.apple\.fps)') {
+        $isDrm = $true
+        $drmMethod = $Matches[1]
+    }
+
+    $variants = New-Object -TypeName System.Collections.Generic.List[object]
+    $lines = $ManifestText -split '\r?\n'
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i].Trim()
+        if ($line -match '^#EXT-X-STREAM-INF:(?<attrs>.+)$') {
+            $attrs = $Matches['attrs']
+            $height = 0
+            $bandwidth = 0
+            if ($attrs -match 'RESOLUTION=\d+x(?<h>\d+)') {
+                $height = [int]$Matches['h']
+            }
+            if ($attrs -match 'BANDWIDTH=(?<b>\d+)') {
+                $bandwidth = [int64]$Matches['b']
+            }
+            for ($j = $i + 1; $j -lt $lines.Count; $j++) {
+                $nextLine = $lines[$j].Trim()
+                if ([string]::IsNullOrWhiteSpace($nextLine)) { continue }
+                if ($nextLine.StartsWith('#')) { continue }
+                $resolvedVarUrl = ConvertFrom-EscapedMediaUrl -RawCandidate $nextLine -BaseUrl $ManifestUrl
+                if (-not [string]::IsNullOrWhiteSpace($resolvedVarUrl)) {
+                    $variants.Add([PSCustomObject]@{
+                        Height    = $height
+                        Bandwidth = $bandwidth
+                        Url       = $resolvedVarUrl
+                    })
+                }
+                $i = $j
+                break
+            }
+        }
+    }
+
+    $sortedVariants = @(
+        $variants | Sort-Object -Property @(
+            @{ Expression = { [int]$_.Height }; Descending = $true },
+            @{ Expression = { [int64]$_.Bandwidth }; Descending = $true }
+        )
+    )
+
+    return [PSCustomObject]@{
+        IsValidHls = $true
+        IsMaster   = ($sortedVariants.Count -gt 0)
+        IsAes128   = $isAes128
+        AesKeyUri  = $aesKeyUri
+        IsDrm      = $isDrm
+        DrmMethod  = $drmMethod
+        Variants   = $sortedVariants
+    }
+}
+
+function Invoke-Layer3StreamInspection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$StreamCandidates
+    )
+
+    $inspected = New-Object -TypeName System.Collections.Generic.List[object]
+    foreach ($cand in $StreamCandidates) {
+        $hasToken = Test-StreamHasAuthToken -StreamUrl $cand.StreamUrl
+        if ($hasToken) {
+            Write-Host "  -> [Katman 3a] Token/imza parametresi tespit edildi; indirirken korunacak: $($cand.StreamUrl)" -ForegroundColor Cyan
+        }
+
+        $isAes128 = $false
+        $isDrm = $false
+        $drmMethod = ''
+        $variants = @()
+
+        if ($cand.StreamType -eq 'm3u8') {
+            $manifestContent = Invoke-WebPageFetch -TargetUrl $cand.StreamUrl -RefererUrl $cand.Referer -UserAgent $script:DefaultUserAgent -TimeoutSeconds 12
+            if (-not [string]::IsNullOrWhiteSpace($manifestContent)) {
+                $hlsInfo = Inspect-HlsManifestContent -ManifestText $manifestContent -ManifestUrl $cand.StreamUrl
+                $isAes128 = $hlsInfo.IsAes128
+                $isDrm = $hlsInfo.IsDrm
+                $drmMethod = $hlsInfo.DrmMethod
+                $variants = $hlsInfo.Variants
+
+                if ($isAes128) {
+                    Write-Host '  -> [Katman 3b] AES-128 şifreli HLS akışı tespit edildi — ffmpeg/yt-dlp ile otomatik çözülecek.' -ForegroundColor Yellow
+                }
+                if ($isDrm) {
+                    Write-Host "  -> [Katman 3c] Uyarı: Bu akışta DRM koruması ($drmMethod) tespit edildi." -ForegroundColor Red
+                }
+            }
+        }
+
+        $inspected.Add([PSCustomObject]@{
+            StreamUrl      = $cand.StreamUrl
+            StreamType     = $cand.StreamType
+            Referer        = $cand.Referer
+            Origin         = $cand.Origin
+            HasToken       = $hasToken
+            DiscoveryLayer = $cand.DiscoveryLayer
+            IsAes128       = $isAes128
+            IsDrm          = $isDrm
+            DrmMethod      = $drmMethod
+            Variants       = $variants
+        })
+    }
+
+    return $inspected.ToArray()
+}
+
+function Test-MediaFileWithFfprobe {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$FilePath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($FilePath) -or -not (Test-Path -LiteralPath $FilePath -PathType Leaf)) {
+        return [PSCustomObject]@{
+            IsValid         = $false
+            FilePath        = $FilePath
+            SizeBytes       = 0
+            SizeText        = '0 MB'
+            DurationSeconds = 0
+            DurationText    = '00:00'
+            Resolution      = 'Bilinmiyor'
+            VideoCodec      = ''
+            AudioCodec      = ''
+            QualitySummary  = 'Doğrulanamadı'
+        }
+    }
+
+    $item = Get-Item -LiteralPath $FilePath -ErrorAction SilentlyContinue
+    if ($null -eq $item -or $item.Length -lt 10240) {
+        return [PSCustomObject]@{
+            IsValid         = $false
+            FilePath        = $FilePath
+            SizeBytes       = if ($null -ne $item) { $item.Length } else { 0 }
+            SizeText        = 'Çok küçük / bozuk'
+            DurationSeconds = 0
+            DurationText    = '00:00'
+            Resolution      = 'Bilinmiyor'
+            VideoCodec      = ''
+            AudioCodec      = ''
+            QualitySummary  = 'Dosya boyutu yetersiz (<10 KB)'
+        }
+    }
+
+    $sizeBytes = [double]$item.Length
+    $sizeText = Format-FileSizeText -Bytes $sizeBytes
+    $ffprobeExe = Resolve-ToolExecutable -ToolName 'ffprobe'
+
+    if ([string]::IsNullOrWhiteSpace($ffprobeExe)) {
+        return [PSCustomObject]@{
+            IsValid         = $true
+            FilePath        = $item.FullName
+            SizeBytes       = $item.Length
+            SizeText        = $sizeText
+            DurationSeconds = 0
+            DurationText    = 'Bilinmiyor'
+            Resolution      = 'Bilinmiyor'
+            VideoCodec      = 'bilinmiyor'
+            AudioCodec      = 'bilinmiyor'
+            QualitySummary  = "Boyut doğrulandı ($sizeText)"
+        }
+    }
+
+    $probeArgs = @(
+        '-v', 'error',
+        '-show_entries', 'format=duration,size:stream=codec_type,codec_name,width,height',
+        '-of', 'json',
+        $item.FullName
+    )
+
+    $prevEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $probeOut = & $ffprobeExe @probeArgs 2>$null
+        $probeExit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+
+    if ($probeExit -ne 0 -or $null -eq $probeOut) {
+        return [PSCustomObject]@{
+            IsValid         = $false
+            FilePath        = $item.FullName
+            SizeBytes       = $item.Length
+            SizeText        = $sizeText
+            DurationSeconds = 0
+            DurationText    = '00:00'
+            Resolution      = 'Bilinmiyor'
+            VideoCodec      = ''
+            AudioCodec      = ''
+            QualitySummary  = 'ffprobe doğrulaması başarısız'
+        }
+    }
+
+    try {
+        $probeJson = ($probeOut -join "`n") | ConvertFrom-Json
+        $streams = if ($probeJson.PSObject.Properties.Match('streams').Count -gt 0 -and $null -ne $probeJson.streams) { @($probeJson.streams) } else { @() }
+        if ($streams.Count -eq 0) {
+            return [PSCustomObject]@{
+                IsValid         = $false
+                FilePath        = $item.FullName
+                SizeBytes       = $item.Length
+                SizeText        = $sizeText
+                DurationSeconds = 0
+                DurationText    = '00:00'
+                Resolution      = 'Bilinmiyor'
+                VideoCodec      = ''
+                AudioCodec      = ''
+                QualitySummary  = 'Geçerli medya akışı bulunamadı'
+            }
+        }
+
+        $vStream = $streams | Where-Object { $_.codec_type -eq 'video' } | Select-Object -First 1
+        $aStream = $streams | Where-Object { $_.codec_type -eq 'audio' } | Select-Object -First 1
+
+        $vCodec = if ($null -ne $vStream -and $vStream.PSObject.Properties.Match('codec_name').Count -gt 0) { [string]$vStream.codec_name } else { '' }
+        $aCodec = if ($null -ne $aStream -and $aStream.PSObject.Properties.Match('codec_name').Count -gt 0) { [string]$aStream.codec_name } else { '' }
+        $resText = if ($null -ne $vStream -and $vStream.PSObject.Properties.Match('width').Count -gt 0 -and $vStream.PSObject.Properties.Match('height').Count -gt 0 -and $vStream.width -and $vStream.height) {
+            "$($vStream.width)x$($vStream.height)"
+        } elseif ([string]::IsNullOrWhiteSpace($vCodec) -and -not [string]::IsNullOrWhiteSpace($aCodec)) {
+            'Yalnızca Ses'
+        } else {
+            'Bilinmiyor'
+        }
+
+        $durSec = 0.0
+        if ($probeJson.PSObject.Properties.Match('format').Count -gt 0 -and $null -ne $probeJson.format -and $probeJson.format.PSObject.Properties.Match('duration').Count -gt 0 -and $null -ne $probeJson.format.duration) {
+            [void][double]::TryParse([string]$probeJson.format.duration, [System.Globalization.NumberStyles]::Any, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$durSec)
+        }
+        $durObj = [PSCustomObject]@{ duration = $durSec }
+        $durText = if ($durSec -gt 0) { Format-DurationText -VideoInfo $durObj } else { 'Bilinmiyor' }
+
+        $codecParts = @($vCodec, $aCodec) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        $codecStr = if ($codecParts.Count -gt 0) { $codecParts -join ' / ' } else { 'bilinmiyor' }
+
+        return [PSCustomObject]@{
+            IsValid         = $true
+            FilePath        = $item.FullName
+            SizeBytes       = $item.Length
+            SizeText        = $sizeText
+            DurationSeconds = $durSec
+            DurationText    = $durText
+            Resolution      = $resText
+            VideoCodec      = $vCodec
+            AudioCodec      = $aCodec
+            QualitySummary  = "$resText ($codecStr, Süre: $durText)"
+        }
+    } catch {
+        return [PSCustomObject]@{
+            IsValid         = ($item.Length -gt 65536)
+            FilePath        = $item.FullName
+            SizeBytes       = $item.Length
+            SizeText        = $sizeText
+            DurationSeconds = 0
+            DurationText    = 'Bilinmiyor'
+            Resolution      = 'Bilinmiyor'
+            VideoCodec      = ''
+            AudioCodec      = ''
+            QualitySummary  = "Boyut: $sizeText"
+        }
+    }
+}
+
+function Format-MediaFetchReport {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Status,
+
+        [Parameter(Mandatory = $false)]
+        [string]$FilePathAndSize = 'Yok',
+
+        [Parameter(Mandatory = $false)]
+        [string]$QualityAndCodec = 'Bilinmiyor',
+
+        [Parameter(Mandatory = $false)]
+        [string]$StreamUrl = 'Yok',
+
+        [Parameter(Mandatory = $false)]
+        [string]$WorkingLayer = '-',
+
+        [Parameter(Mandatory = $false)]
+        [string]$Notes = 'Yok'
+    )
+
+    $lines = @(
+        "  ✅ Durum: $Status",
+        "  📁 Dosya: $FilePathAndSize",
+        "  🎬 Kalite: $QualityAndCodec",
+        "  🔗 Kullanılan akış: $StreamUrl",
+        "  🧩 Çalışan katman: $WorkingLayer",
+        "  ⚠️ Notlar: $Notes"
+    )
+    return ($lines -join "`n")
+}
+
+function Write-MediaFetchReport {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Status,
+
+        [Parameter(Mandatory = $false)]
+        [string]$FilePathAndSize = 'Yok',
+
+        [Parameter(Mandatory = $false)]
+        [string]$QualityAndCodec = 'Bilinmiyor',
+
+        [Parameter(Mandatory = $false)]
+        [string]$StreamUrl = 'Yok',
+
+        [Parameter(Mandatory = $false)]
+        [string]$WorkingLayer = '-',
+
+        [Parameter(Mandatory = $false)]
+        [string]$Notes = 'Yok'
+    )
+
+    Write-Host ''
+    Write-Host '=== MediaFetch Sonuç Raporu ===' -ForegroundColor Cyan
+    $reportText = Format-MediaFetchReport `
+        -Status $Status `
+        -FilePathAndSize $FilePathAndSize `
+        -QualityAndCodec $QualityAndCodec `
+        -StreamUrl $StreamUrl `
+        -WorkingLayer $WorkingLayer `
+        -Notes $Notes
+    foreach ($line in ($reportText -split "`n")) {
+        $color = if ($Status -eq 'Başarılı') { [ConsoleColor]::Green } elseif ($Status -eq 'Kısmi') { [ConsoleColor]::Yellow } else { [ConsoleColor]::Red }
+        Write-Host $line -ForegroundColor $color
+    }
+    Write-Host ''
+}
+
+function Invoke-FfmpegStreamDownload {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FfmpegPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$StreamUrl,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputFilePath,
+
+        [Parameter(Mandatory = $false)]
+        [string]$RefererUrl = '',
+
+        [Parameter(Mandatory = $false)]
+        [string]$OriginUrl = '',
+
+        [Parameter(Mandatory = $false)]
+        [string]$UserAgent = $script:DefaultUserAgent,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$IsAudioOnly,
+
+        [Parameter(Mandatory = $false)]
+        [string]$AudioFormat = 'mp3',
+
+        [Parameter(Mandatory = $false)]
+        [switch]$IncludeAllStreams
+    )
+
+    $headerLines = New-Object -TypeName System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($RefererUrl)) {
+        $headerLines.Add("Referer: $($RefererUrl.Trim())")
+    }
+    if (-not [string]::IsNullOrWhiteSpace($OriginUrl)) {
+        $headerLines.Add("Origin: $($OriginUrl.Trim())")
+    }
+    $headerLines.Add("User-Agent: $UserAgent")
+    $headerBlock = ($headerLines -join "`r`n") + "`r`n"
+
+    $ffArgs = New-Object -TypeName System.Collections.Generic.List[string]
+    $ffArgs.Add('-y')
+    $ffArgs.Add('-nostdin')
+    $ffArgs.Add('-loglevel')
+    $ffArgs.Add('warning')
+    $ffArgs.Add('-stats')
+    $ffArgs.Add('-tls_verify')
+    $ffArgs.Add('0')
+    $ffArgs.Add('-user_agent')
+    $ffArgs.Add($UserAgent)
+    $ffArgs.Add('-headers')
+    $ffArgs.Add($headerBlock)
+    $ffArgs.Add('-allowed_extensions')
+    $ffArgs.Add('ALL')
+    $ffArgs.Add('-protocol_whitelist')
+    $ffArgs.Add('file,http,https,tcp,tls,crypto,data')
+    $ffArgs.Add('-i')
+    $ffArgs.Add($StreamUrl)
+
+    if ($IsAudioOnly) {
+        $ffArgs.Add('-vn')
+        switch ($AudioFormat) {
+            'mp3'  { $ffArgs.Add('-c:a'); $ffArgs.Add('libmp3lame'); $ffArgs.Add('-q:a'); $ffArgs.Add('2') }
+            'm4a'  { $ffArgs.Add('-c:a'); $ffArgs.Add('aac'); $ffArgs.Add('-b:a'); $ffArgs.Add('192k') }
+            'opus' { $ffArgs.Add('-c:a'); $ffArgs.Add('libopus'); $ffArgs.Add('-b:a'); $ffArgs.Add('160k') }
+            'wav'  { $ffArgs.Add('-c:a'); $ffArgs.Add('pcm_s16le') }
+            default { $ffArgs.Add('-c:a'); $ffArgs.Add('copy') }
+        }
+    } else {
+        if ($IncludeAllStreams) {
+            $ffArgs.Add('-map')
+            $ffArgs.Add('0:v:0?')
+            $ffArgs.Add('-map')
+            $ffArgs.Add('0:a?')
+            $ffArgs.Add('-map')
+            $ffArgs.Add('0:s?')
+        }
+        $ffArgs.Add('-c')
+        $ffArgs.Add('copy')
+        if ($OutputFilePath -match '(?i)\.mp4$') {
+            $ffArgs.Add('-bsf:a')
+            $ffArgs.Add('aac_adtstoasc')
+        }
+    }
+
+    $ffArgs.Add($OutputFilePath)
+
+    $prevEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $ffArgsArr = $ffArgs.ToArray()
+        & $FfmpegPath @ffArgsArr
+        return ($LASTEXITCODE -eq 0)
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+}
+
+function Invoke-Layer4DownloadAndVerify {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$InspectedStreams,
+
+        [Parameter(Mandatory = $true)]
+        $Deps,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputDir,
+
+        [Parameter(Mandatory = $false)]
+        [string]$PageTitle = '',
+
+        [Parameter(Mandatory = $false)]
+        [string]$SelectedQuality = 'best',
+
+        [Parameter(Mandatory = $false)]
+        [string]$SelectedFormat = 'mp4',
+
+        [Parameter(Mandatory = $false)]
+        [switch]$IsAudioOnly,
+
+        [Parameter(Mandatory = $false)]
+        [string]$SubtitleLangs = '',
+
+        [Parameter(Mandatory = $false)]
+        [string]$BrowserCookies = ''
+    )
+
+    $safeTitle = ConvertTo-SafeFileName -RawTitle $PageTitle
+    $ext = if ($IsAudioOnly) {
+        if ([string]::IsNullOrWhiteSpace($SelectedFormat)) { 'mp3' } else { $SelectedFormat }
+    } else {
+        if ([string]::IsNullOrWhiteSpace($SelectedFormat)) { 'mp4' } else { $SelectedFormat }
+    }
+    $ffmpegDir = Split-Path -Path $Deps.FfmpegPath -Parent
+    $nm3u8Exe = Resolve-ToolExecutable -ToolName 'N_m3u8DL-RE'
+    $streamlinkExe = Resolve-ToolExecutable -ToolName 'streamlink'
+
+    foreach ($cand in $InspectedStreams) {
+        if ($cand.IsDrm) {
+            continue
+        }
+
+        $urlsToTry = New-Object -TypeName System.Collections.Generic.List[string]
+        $urlsToTry.Add($cand.StreamUrl)
+
+        if ($null -ne $cand.Variants -and $cand.Variants.Count -gt 0) {
+            $reqH = 0
+            if (-not [string]::IsNullOrWhiteSpace($SelectedQuality) -and $SelectedQuality -ne 'best') {
+                [void][int]::TryParse(($SelectedQuality -replace 'p$', ''), [ref]$reqH)
+            }
+            $orderedVars = if ($reqH -gt 0) {
+                @(
+                    $cand.Variants | Sort-Object -Property @(
+                        @{ Expression = { if ($_.Height -le $reqH -and $_.Height -gt 0) { 1 } else { 0 } }; Descending = $true },
+                        @{ Expression = { [Math]::Abs($_.Height - $reqH) }; Ascending = $true }
+                    )
+                )
+            } else {
+                @($cand.Variants)
+            }
+            foreach ($v in $orderedVars) {
+                if (-not $urlsToTry.Contains($v.Url)) {
+                    $urlsToTry.Add($v.Url)
+                }
+            }
+        }
+
+        foreach ($tryUrl in $urlsToTry) {
+            $outFile = Join-Path -Path $OutputDir -ChildPath "$safeTitle.$ext"
+            if (Test-Path -LiteralPath $outFile) {
+                $outFile = Join-Path -Path $OutputDir -ChildPath "${safeTitle}_$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()).$ext"
+            }
+
+            # 4d-1: yt-dlp --hls-prefer-ffmpeg + Referer + User-Agent
+            Write-Host "  -> [Katman 4] yt-dlp (--hls-prefer-ffmpeg + Referer) ile indiriliyor: $tryUrl" -ForegroundColor Cyan
+            $printFile = Join-Path -Path $env:TEMP -ChildPath "videodl_l4_path_$([guid]::NewGuid().ToString('N')).txt"
+            $customTemplate = Join-Path -Path $OutputDir -ChildPath "$safeTitle [%(id)s].%(ext)s"
+            $ytArgs = Get-YtDlpArgumentList `
+                -TargetUrl $tryUrl `
+                -SelectedQuality $SelectedQuality `
+                -SelectedFormat $ext `
+                -IsAudioOnly:$IsAudioOnly `
+                -OutputDirectory $OutputDir `
+                -SubtitleLangs $SubtitleLangs `
+                -BrowserCookies $BrowserCookies `
+                -FfmpegPath $ffmpegDir `
+                -PrintFilePath $printFile `
+                -NoCheckCertificate `
+                -HlsPreferFfmpeg `
+                -RefererUrl $cand.Referer `
+                -OriginUrl $cand.Origin `
+                -UserAgent $script:DefaultUserAgent `
+                -CustomOutputTemplate $customTemplate
+
+            $prevEap = $ErrorActionPreference
+            $ytExit = 1
+            try {
+                $ErrorActionPreference = 'Continue'
+                & $Deps.YtDlpPath @ytArgs 2>$null
+                $ytExit = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $prevEap
+            }
+
+            $ytProducedFile = $null
+            if (Test-Path -LiteralPath $printFile) {
+                $pLines = @(Get-Content -LiteralPath $printFile -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                if ($pLines.Count -gt 0) {
+                    $ytProducedFile = $pLines[-1].Trim()
+                }
+                Remove-Item -LiteralPath $printFile -Force -ErrorAction SilentlyContinue
+            }
+            if ($ytExit -eq 0 -and -not [string]::IsNullOrWhiteSpace($ytProducedFile) -and (Test-Path -LiteralPath $ytProducedFile)) {
+                $probe = Test-MediaFileWithFfprobe -FilePath $ytProducedFile
+                if ($probe.IsValid) {
+                    return [PSCustomObject]@{
+                        Success      = $true
+                        FilePath     = $probe.FilePath
+                        SizeText     = $probe.SizeText
+                        QualityText  = $probe.QualitySummary
+                        StreamUrl    = $tryUrl
+                        WorkingLayer = "Katman 4d ($($cand.DiscoveryLayer) + yt-dlp --hls-prefer-ffmpeg)"
+                        Notes        = if ($cand.IsAes128) { 'AES-128 HLS otomatik çözüldü; ffprobe ile doğrulandı.' } elseif ($cand.HasToken) { 'Token ve Referer korunarak indirildi; ffprobe ile doğrulandı.' } else { 'ffprobe ile doğrulandı.' }
+                    }
+                }
+                Write-Host '  -> [Katman 4e] İndirilen dosya doğrulamadan geçemedi, doğrudan ffmpeg (Katman 4a/4c) deneniyor...' -ForegroundColor Yellow
+                Remove-Item -LiteralPath $ytProducedFile -Force -ErrorAction SilentlyContinue
+            }
+
+            # 4a/4b/4c: Doğrudan ffmpeg (çoklu ses/altyazı map ile, başarısızsa standart copy ile)
+            Write-Host "  -> [Katman 4a/4c] Doğrudan ffmpeg (-c copy -bsf:a aac_adtstoasc) ile indiriliyor: $tryUrl" -ForegroundColor Cyan
+            $ffOk = Invoke-FfmpegStreamDownload `
+                -FfmpegPath $Deps.FfmpegPath `
+                -StreamUrl $tryUrl `
+                -OutputFilePath $outFile `
+                -RefererUrl $cand.Referer `
+                -OriginUrl $cand.Origin `
+                -UserAgent $script:DefaultUserAgent `
+                -IsAudioOnly:$IsAudioOnly `
+                -AudioFormat $ext `
+                -IncludeAllStreams
+
+            if (-not $ffOk -or -not (Test-MediaFileWithFfprobe -FilePath $outFile).IsValid) {
+                if (Test-Path -LiteralPath $outFile) {
+                    Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue
+                }
+                Write-Host '  -> [Katman 4a] Çoklu akış eşlemesi uyumsuz, temel video+ses akışı ve alternatif User-Agent ile tekrar deneniyor...' -ForegroundColor Yellow
+                $ffOk = Invoke-FfmpegStreamDownload `
+                    -FfmpegPath $Deps.FfmpegPath `
+                    -StreamUrl $tryUrl `
+                    -OutputFilePath $outFile `
+                    -RefererUrl $cand.Referer `
+                    -OriginUrl $cand.Origin `
+                    -UserAgent $script:AltUserAgent `
+                    -IsAudioOnly:$IsAudioOnly `
+                    -AudioFormat $ext
+            }
+
+            if ($ffOk -and (Test-Path -LiteralPath $outFile)) {
+                $probe = Test-MediaFileWithFfprobe -FilePath $outFile
+                if ($probe.IsValid) {
+                    return [PSCustomObject]@{
+                        Success      = $true
+                        FilePath     = $probe.FilePath
+                        SizeText     = $probe.SizeText
+                        QualityText  = $probe.QualitySummary
+                        StreamUrl    = $tryUrl
+                        WorkingLayer = "Katman 4a ($($cand.DiscoveryLayer) + doğrudan ffmpeg)"
+                        Notes        = if ($cand.IsAes128) { 'AES-128 HLS doğrudan ffmpeg ile çözüldü ve doğrulandı.' } elseif ($cand.HasToken) { 'Token ve Referer başlıkları korunarak doğrudan ffmpeg ile indirildi.' } else { 'Doğrudan ffmpeg ile indirildi ve ffprobe ile doğrulandı.' }
+                    }
+                }
+                Write-Host '  -> [Katman 4e] Dosya ffprobe kontrolünden geçemedi, sıradaki araç/varyant deneniyor...' -ForegroundColor Yellow
+                Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue
+            }
+
+            # 4d-2: N_m3u8DL-RE (varsa)
+            if (-not [string]::IsNullOrWhiteSpace($nm3u8Exe) -and $cand.StreamType -eq 'm3u8') {
+                Write-Host '  -> [Katman 4d] N_m3u8DL-RE ile deneniyor...' -ForegroundColor Cyan
+                $nmArgs = @(
+                    $tryUrl,
+                    '--save-dir', $OutputDir,
+                    '--save-name', $safeTitle,
+                    '--header', "Referer: $($cand.Referer)",
+                    '--header', "User-Agent: $script:DefaultUserAgent",
+                    '--auto-select',
+                    '--no-log'
+                )
+                $prevEap = $ErrorActionPreference
+                try {
+                    $ErrorActionPreference = 'Continue'
+                    & $nm3u8Exe @nmArgs 2>$null
+                } finally {
+                    $ErrorActionPreference = $prevEap
+                }
+                $nmFile = Get-ChildItem -LiteralPath $OutputDir -Filter "$safeTitle*" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                if ($null -ne $nmFile) {
+                    $probe = Test-MediaFileWithFfprobe -FilePath $nmFile.FullName
+                    if ($probe.IsValid) {
+                        return [PSCustomObject]@{
+                            Success      = $true
+                            FilePath     = $probe.FilePath
+                            SizeText     = $probe.SizeText
+                            QualityText  = $probe.QualitySummary
+                            StreamUrl    = $tryUrl
+                            WorkingLayer = 'Katman 4d (N_m3u8DL-RE)'
+                            Notes        = 'N_m3u8DL-RE ile indirildi ve ffprobe ile doğrulandı.'
+                        }
+                    }
+                }
+            }
+
+            # 4d-3: streamlink (varsa)
+            if (-not [string]::IsNullOrWhiteSpace($streamlinkExe) -and $cand.StreamType -eq 'm3u8') {
+                Write-Host '  -> [Katman 4d] streamlink ile deneniyor...' -ForegroundColor Cyan
+                $slArgs = @(
+                    '--http-no-ssl-verify',
+                    '--http-header', "Referer=$($cand.Referer)",
+                    '--http-header', "User-Agent=$script:DefaultUserAgent",
+                    '-o', $outFile,
+                    $tryUrl,
+                    'best'
+                )
+                $prevEap = $ErrorActionPreference
+                try {
+                    $ErrorActionPreference = 'Continue'
+                    & $streamlinkExe @slArgs 2>$null
+                } finally {
+                    $ErrorActionPreference = $prevEap
+                }
+                if (Test-Path -LiteralPath $outFile) {
+                    $probe = Test-MediaFileWithFfprobe -FilePath $outFile
+                    if ($probe.IsValid) {
+                        return [PSCustomObject]@{
+                            Success      = $true
+                            FilePath     = $probe.FilePath
+                            SizeText     = $probe.SizeText
+                            QualityText  = $probe.QualitySummary
+                            StreamUrl    = $tryUrl
+                            WorkingLayer = 'Katman 4d (streamlink)'
+                            Notes        = 'streamlink ile indirildi ve ffprobe ile doğrulandı.'
+                        }
+                    }
+                    Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+    }
+
+    return [PSCustomObject]@{
+        Success      = $false
+        FilePath     = ''
+        SizeText     = '0 MB'
+        QualityText  = 'Yok'
+        StreamUrl    = if ($InspectedStreams.Count -gt 0) { $InspectedStreams[0].StreamUrl } else { '' }
+        WorkingLayer = '-'
+        Notes        = 'Aday akışlar indirilemedi.'
+    }
+}
+
 function Get-VideoMetadata {
     [CmdletBinding()]
     param(
@@ -1224,7 +2864,22 @@ function Get-VideoMetadata {
         [string]$TargetUrl,
 
         [Parameter(Mandatory = $false)]
-        [string]$BrowserCookies
+        [string]$BrowserCookies,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$NoCheckCertificate,
+
+        [Parameter(Mandatory = $false)]
+        [string]$RefererUrl,
+
+        [Parameter(Mandatory = $false)]
+        [string]$OriginUrl,
+
+        [Parameter(Mandatory = $false)]
+        [string]$UserAgent,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$SuppressErrorOutput
     )
 
     $metaArgs = New-Object -TypeName System.Collections.Generic.List[string]
@@ -1232,6 +2887,21 @@ function Get-VideoMetadata {
     $metaArgs.Add('--no-playlist')
     $metaArgs.Add('--no-warnings')
     $metaArgs.Add('--no-update')
+    if ($NoCheckCertificate) {
+        $metaArgs.Add('--no-check-certificate')
+    }
+    if (-not [string]::IsNullOrWhiteSpace($RefererUrl)) {
+        $metaArgs.Add('--referer')
+        $metaArgs.Add($RefererUrl.Trim())
+    }
+    if (-not [string]::IsNullOrWhiteSpace($UserAgent)) {
+        $metaArgs.Add('--user-agent')
+        $metaArgs.Add($UserAgent.Trim())
+    }
+    if (-not [string]::IsNullOrWhiteSpace($OriginUrl)) {
+        $metaArgs.Add('--add-header')
+        $metaArgs.Add("Origin:$($OriginUrl.Trim())")
+    }
     if (-not [string]::IsNullOrWhiteSpace($BrowserCookies)) {
         $metaArgs.Add('--cookies-from-browser')
         $metaArgs.Add($BrowserCookies.Trim())
@@ -1255,19 +2925,24 @@ function Get-VideoMetadata {
         $rawErr = Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
     }
+    $script:LastYtDlpRawError = $rawErr
 
     if ($exitCode -ne 0 -or $null -eq $jsonLines) {
         if (-not [string]::IsNullOrWhiteSpace($rawErr)) {
             Write-Verbose "yt-dlp ham hata çıktısı:`n$rawErr"
         }
-        $friendlyMsg = Convert-YtDlpErrorToTurkish -RawError $rawErr
-        Write-Host $friendlyMsg -ForegroundColor Red
+        if (-not $SuppressErrorOutput) {
+            $friendlyMsg = Convert-YtDlpErrorToTurkish -RawError $rawErr
+            Write-Host $friendlyMsg -ForegroundColor Red
+        }
         return $null
     }
 
     $jsonText = ($jsonLines -join "`n").Trim()
     if ([string]::IsNullOrWhiteSpace($jsonText)) {
-        Write-Host 'Hata: Video bilgileri alınamadı (boş yanıt).' -ForegroundColor Red
+        if (-not $SuppressErrorOutput) {
+            Write-Host 'Hata: Video bilgileri alınamadı (boş yanıt).' -ForegroundColor Red
+        }
         return $null
     }
 
@@ -1275,9 +2950,230 @@ function Get-VideoMetadata {
         return ($jsonText | ConvertFrom-Json)
     } catch {
         Write-Verbose "JSON ayrıştırma hatası: $($_.Exception.Message)"
-        Write-Host 'Hata: Video meta verisi okunamadı.' -ForegroundColor Red
+        if (-not $SuppressErrorOutput) {
+            Write-Host 'Hata: Video meta verisi okunamadı.' -ForegroundColor Red
+        }
         return $null
     }
+}
+
+function Invoke-LayeredFallbackPipeline {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetUrl,
+
+        [Parameter(Mandatory = $true)]
+        $Deps,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputDir,
+
+        [Parameter(Mandatory = $false)]
+        [string]$SelectedQuality = 'best',
+
+        [Parameter(Mandatory = $false)]
+        [string]$SelectedFormat = 'mp4',
+
+        [Parameter(Mandatory = $false)]
+        [switch]$IsAudioOnly,
+
+        [Parameter(Mandatory = $false)]
+        [string]$SubtitleLangs = '',
+
+        [Parameter(Mandatory = $false)]
+        [string]$BrowserCookies = '',
+
+        [Parameter(Mandatory = $false)]
+        [switch]$IsInteractive
+    )
+
+    Write-Host ''
+    Write-Host '[Katman 1] Standart yt-dlp çıkarımı başarısız oldu — Katman 2 (Sayfa Kaynağı, Iframe, Packed JS ve Base64 Analizi) başlatılıyor...' -ForegroundColor Yellow
+
+    if (-not (Test-Path -LiteralPath $OutputDir)) {
+        New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+    }
+
+    # KATMAN 2: Sayfa kaynağı + iç içe iframe + packed JS + Base64 + Headless Browser
+    $l2Result = Invoke-Layer2PageAnalysis -TargetUrl $TargetUrl -MaxIframeDepth 3
+    $pageTitle = if (-not [string]::IsNullOrWhiteSpace($l2Result.PageTitle)) { $l2Result.PageTitle } else { 'video' }
+
+    # Eğer doğrudan akış bulunamadıysa ama iframe'ler bulunduysa önce iframe adreslerini yt-dlp (Katman 2c -> 1b) ile dene
+    if ($l2Result.Streams.Count -eq 0 -and $l2Result.IframeUrls.Count -gt 0) {
+        Write-Host "[Katman 2c] Sayfada $($l2Result.IframeUrls.Count) adet gömülü iframe oynatıcı bulundu, analiz ediliyor..." -ForegroundColor Cyan
+        $ffmpegDir = Split-Path -Path $Deps.FfmpegPath -Parent
+        foreach ($ifUrl in $l2Result.IframeUrls) {
+            Write-Host "  -> [Katman 2c] Gömülü oynatıcı yt-dlp + Referer ile deneniyor: $ifUrl" -ForegroundColor Cyan
+            $printFile = Join-Path -Path $env:TEMP -ChildPath "videodl_if_path_$([guid]::NewGuid().ToString('N')).txt"
+            $ext = if ($IsAudioOnly) { if ($SelectedFormat) { $SelectedFormat } else { 'mp3' } } else { if ($SelectedFormat) { $SelectedFormat } else { 'mp4' } }
+            $ytIfArgs = Get-YtDlpArgumentList `
+                -TargetUrl $ifUrl `
+                -SelectedQuality $(if ($SelectedQuality) { $SelectedQuality } else { 'best' }) `
+                -SelectedFormat $ext `
+                -IsAudioOnly:$IsAudioOnly `
+                -OutputDirectory $OutputDir `
+                -SubtitleLangs $SubtitleLangs `
+                -BrowserCookies $BrowserCookies `
+                -FfmpegPath $ffmpegDir `
+                -PrintFilePath $printFile `
+                -NoCheckCertificate `
+                -HlsPreferFfmpeg `
+                -RefererUrl $TargetUrl `
+                -OriginUrl (Get-UrlOrigin -InputUrl $TargetUrl) `
+                -UserAgent $script:DefaultUserAgent
+
+            $prevEap = $ErrorActionPreference
+            $ifExit = 1
+            try {
+                $ErrorActionPreference = 'Continue'
+                & $Deps.YtDlpPath @ytIfArgs 2>$null
+                $ifExit = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $prevEap
+            }
+
+            if ($ifExit -eq 0 -and (Test-Path -LiteralPath $printFile)) {
+                $pLines = @(Get-Content -LiteralPath $printFile -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                Remove-Item -LiteralPath $printFile -Force -ErrorAction SilentlyContinue
+                if ($pLines.Count -gt 0 -and (Test-Path -LiteralPath $pLines[-1].Trim())) {
+                    $probe = Test-MediaFileWithFfprobe -FilePath $pLines[-1].Trim()
+                    if ($probe.IsValid) {
+                        Write-MediaFetchReport `
+                            -Status 'Başarılı' `
+                            -FilePathAndSize "$($probe.FilePath) ($($probe.SizeText))" `
+                            -QualityAndCodec $probe.QualitySummary `
+                            -StreamUrl $ifUrl `
+                            -WorkingLayer 'Katman 2c (Iframe Çıkarımı + yt-dlp)' `
+                            -Notes 'Gömülü iframe oynatıcı Referer başlığıyla çözüldü ve ffprobe ile doğrulandı.'
+                        return $true
+                    }
+                }
+            }
+            if (Test-Path -LiteralPath $printFile) {
+                Remove-Item -LiteralPath $printFile -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    # KATMAN 5a Erken Destek: Eğer hala akış yoksa Headless Browser derin tarama çalıştır
+    if ($l2Result.Streams.Count -eq 0) {
+        Write-Host '[Katman 2 -> Katman 5a] Statik kaynakta doğrudan akış bulunamadı; Headless tarayıcı derin DOM analizi çalıştırılıyor...' -ForegroundColor Yellow
+        $l2Result = Invoke-Layer2PageAnalysis -TargetUrl $TargetUrl -MaxIframeDepth 3 -UseHeadlessBrowser
+        if (-not [string]::IsNullOrWhiteSpace($l2Result.PageTitle)) {
+            $pageTitle = $l2Result.PageTitle
+        }
+    }
+
+    if ($l2Result.Streams.Count -eq 0) {
+        if ($l2Result.HasDrmHint) {
+            $altInfo = if ($l2Result.IframeUrls.Count -gt 0) { "Alternatif iframe'ler: $($l2Result.IframeUrls -join ', ')" } else { 'Alternatif sunucu bulunamadı.' }
+            Write-Host '⚠️ Bu içerik DRM (Widevine/FairPlay) korumalı, yasal olarak indirilemez.' -ForegroundColor Red
+            Write-MediaFetchReport `
+                -Status 'Kısmi (DRM Korumalı)' `
+                -FilePathAndSize 'İndirilmedi (DRM Koruması)' `
+                -QualityAndCodec 'DRM Şifreli Akış' `
+                -StreamUrl $TargetUrl `
+                -WorkingLayer 'Katman 3c (DRM Tespiti)' `
+                -Notes "Bu içerik DRM korumalı ($($l2Result.DrmDetails)), yasal olarak indirilemez. $altInfo"
+            return $false
+        }
+
+        Write-MediaFetchReport `
+            -Status 'Başarısız' `
+            -FilePathAndSize 'Yok' `
+            -QualityAndCodec 'Yok' `
+            -StreamUrl $TargetUrl `
+            -WorkingLayer 'Katman 1-5 denendi' `
+            -Notes $(if ($l2Result.IframeUrls.Count -gt 0) { "Oturum/çerez gerekiyor olabilir (-Cookies <tarayici> deneyin). Bulunan iframe'ler: $($l2Result.IframeUrls -join ', ')" } else { 'Sayfa oturum açma veya etkileşimli doğrulama gerektiriyor olabilir (-Cookies firefox/chrome/edge deneyin).' })
+        return $false
+    }
+
+    Write-Host "[Katman 2] Toplam $($l2Result.Streams.Count) adet medya akış adayı yakalandı. Katman 3 (Token, AES-128 ve DRM Analizi) başlatılıyor..." -ForegroundColor Cyan
+
+    # KATMAN 3: Token, AES-128 ve DRM kontrolü
+    $inspectedStreams = @(Invoke-Layer3StreamInspection -StreamCandidates $l2Result.Streams)
+    $nonDrmStreams = @($inspectedStreams | Where-Object { -not $_.IsDrm })
+
+    if ($nonDrmStreams.Count -eq 0) {
+        $firstDrm = $inspectedStreams[0]
+        $subNote = if ($l2Result.Subtitles.Count -gt 0) { "Altyazılar: $($l2Result.Subtitles -join ', ')" } else { 'Ek altyazı bulunamadı.' }
+        Write-Host '⚠️ Bu içerik DRM korumalı, yasal olarak indirilemez.' -ForegroundColor Red
+        Write-MediaFetchReport `
+            -Status 'Kısmi (DRM Korumalı)' `
+            -FilePathAndSize 'İndirilmedi (DRM Koruması)' `
+            -QualityAndCodec "DRM ($($firstDrm.DrmMethod))" `
+            -StreamUrl $firstDrm.StreamUrl `
+            -WorkingLayer 'Katman 3c (DRM Tespiti)' `
+            -Notes "Bu içerik DRM korumalı, yasal olarak indirilemez. $subNote"
+        return $false
+    }
+
+    # Etkileşimli modda kullanıcı henüz kalite/format seçmediyse hızlıca sor veya varsayılan en iyiyi kullan
+    $effQuality = if ([string]::IsNullOrWhiteSpace($SelectedQuality)) { 'best' } else { $SelectedQuality }
+    $effFormat = if ([string]::IsNullOrWhiteSpace($SelectedFormat)) {
+        if ($IsAudioOnly) { 'mp3' } else { 'mp4' }
+    } else {
+        $SelectedFormat
+    }
+
+    # KATMAN 4: İndirme, birleştirme ve ffprobe doğrulama
+    Write-Host '[Katman 4] Akış indirme, birleştirme ve ffprobe doğrulama katmanı başlatılıyor...' -ForegroundColor Cyan
+    $l4Result = Invoke-Layer4DownloadAndVerify `
+        -InspectedStreams $nonDrmStreams `
+        -Deps $Deps `
+        -OutputDir $OutputDir `
+        -PageTitle $pageTitle `
+        -SelectedQuality $effQuality `
+        -SelectedFormat $effFormat `
+        -IsAudioOnly:$IsAudioOnly `
+        -SubtitleLangs $SubtitleLangs `
+        -BrowserCookies $BrowserCookies
+
+    # Harici altyazı varsa (.vtt/.srt) yanına kaydet
+    if ($l4Result.Success -and $l2Result.Subtitles.Count -gt 0) {
+        $baseOutNoExt = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($l4Result.FilePath), [System.IO.Path]::GetFileNameWithoutExtension($l4Result.FilePath))
+        for ($si = 0; $si -lt $l2Result.Subtitles.Count; $si++) {
+            $subUrl = $l2Result.Subtitles[$si]
+            $subExt = if ($subUrl -match '(?i)\.srt(\?|$)') { 'srt' } else { 'vtt' }
+            $subFile = "${baseOutNoExt}.sub$($si + 1).$subExt"
+            $subText = Invoke-WebPageFetch -TargetUrl $subUrl -RefererUrl $TargetUrl
+            if (-not [string]::IsNullOrWhiteSpace($subText)) {
+                [System.IO.File]::WriteAllText($subFile, $subText, [System.Text.Encoding]::UTF8)
+            }
+        }
+    }
+
+    if ($l4Result.Success) {
+        Write-MediaFetchReport `
+            -Status 'Başarılı' `
+            -FilePathAndSize "$($l4Result.FilePath) ($($l4Result.SizeText))" `
+            -QualityAndCodec $l4Result.QualityText `
+            -StreamUrl $l4Result.StreamUrl `
+            -WorkingLayer $l4Result.WorkingLayer `
+            -Notes $l4Result.Notes
+
+        if ($IsInteractive) {
+            $openAns = Read-Host -Prompt 'Open folder? (y/N)'
+            if (-not [string]::IsNullOrWhiteSpace($openAns) -and $openAns.Trim() -match '^(y|yes|e|evet)$') {
+                if (Test-Path -LiteralPath $l4Result.FilePath -PathType Leaf) {
+                    Start-Process -FilePath 'explorer.exe' -ArgumentList @("/select,`"$($l4Result.FilePath)`"")
+                } else {
+                    Start-Process -FilePath 'explorer.exe' -ArgumentList @("`"$OutputDir`"")
+                }
+            }
+        }
+        return $true
+    }
+
+    Write-MediaFetchReport `
+        -Status 'Kısmi (Akış Bulundu, İndirilemedi)' `
+        -FilePathAndSize 'Yok' `
+        -QualityAndCodec 'Bilinmiyor' `
+        -StreamUrl $l4Result.StreamUrl `
+        -WorkingLayer 'Katman 2-4 (Akış Yakalandı)' `
+        -Notes 'Akış adresi yakalandı ancak sunucu oturum çerezi bekliyor olabilir (-Cookies <tarayici> parametresiyle tekrar deneyin).'
+    return $false
 }
 
 function Invoke-VideoDownload {
@@ -1300,6 +3196,8 @@ function Invoke-VideoDownload {
         $targetUrl = $targetUrl.Trim()
     }
 
+    Write-Host 'Bilgi: İndirdiğin içeriğin kullanım haklarına sahip olduğundan emin ol.' -ForegroundColor DarkGray
+
     $deps = Assert-Dependencies -IsInteractive:$isInteractive
     if ($null -eq $deps) {
         $script:ProcessExitCode = 1
@@ -1310,12 +3208,40 @@ function Invoke-VideoDownload {
     $selectedFormat = $ResolvedParams.Format
     $isAudioOnly = [bool]$ResolvedParams.IsAudioOnly
     $outputDir = $ResolvedParams.Output
+    $originUrl = Get-UrlOrigin -InputUrl $targetUrl
+    $usedLayer1b = $false
 
     if ($isInteractive) {
-        Write-Host 'Video bilgileri alınıyor...' -ForegroundColor Cyan
-        $videoInfo = Get-VideoMetadata -YtDlpPath $deps.YtDlpPath -TargetUrl $targetUrl -BrowserCookies $ResolvedParams.Cookies
+        Write-Host '[Katman 1a] Video bilgileri alınıyor (yt-dlp)...' -ForegroundColor Cyan
+        $videoInfo = Get-VideoMetadata -YtDlpPath $deps.YtDlpPath -TargetUrl $targetUrl -BrowserCookies $ResolvedParams.Cookies -SuppressErrorOutput
         if ($null -eq $videoInfo) {
-            $script:ProcessExitCode = 1
+            Write-Host '[Katman 1a] Başarısız — [Katman 1b] --no-check-certificate, Referer ve User-Agent başlıklarıyla tekrar deneniyor...' -ForegroundColor Yellow
+            $videoInfo = Get-VideoMetadata `
+                -YtDlpPath $deps.YtDlpPath `
+                -TargetUrl $targetUrl `
+                -BrowserCookies $ResolvedParams.Cookies `
+                -NoCheckCertificate `
+                -RefererUrl $targetUrl `
+                -OriginUrl $originUrl `
+                -UserAgent $script:DefaultUserAgent `
+                -SuppressErrorOutput
+            if ($null -ne $videoInfo) {
+                $usedLayer1b = $true
+            }
+        }
+
+        if ($null -eq $videoInfo) {
+            $fallbackOk = Invoke-LayeredFallbackPipeline `
+                -TargetUrl $targetUrl `
+                -Deps $deps `
+                -OutputDir $outputDir `
+                -SelectedQuality $selectedQuality `
+                -SelectedFormat $selectedFormat `
+                -IsAudioOnly:$isAudioOnly `
+                -SubtitleLangs $ResolvedParams.Subs `
+                -BrowserCookies $ResolvedParams.Cookies `
+                -IsInteractive:$isInteractive
+            $script:ProcessExitCode = if ($fallbackOk) { 0 } else { 1 }
             return
         }
 
@@ -1386,9 +3312,34 @@ function Invoke-VideoDownload {
         }
     } else {
         if ((-not $isAudioOnly) -and (-not $ResolvedParams.Playlist) -and ($selectedQuality -ne 'best')) {
-            $videoInfo = Get-VideoMetadata -YtDlpPath $deps.YtDlpPath -TargetUrl $targetUrl -BrowserCookies $ResolvedParams.Cookies
+            $videoInfo = Get-VideoMetadata -YtDlpPath $deps.YtDlpPath -TargetUrl $targetUrl -BrowserCookies $ResolvedParams.Cookies -SuppressErrorOutput
             if ($null -eq $videoInfo) {
-                $script:ProcessExitCode = 1
+                Write-Host '[Katman 1a] Başarısız — [Katman 1b] --no-check-certificate ve Referer ile tekrar deneniyor...' -ForegroundColor Yellow
+                $videoInfo = Get-VideoMetadata `
+                    -YtDlpPath $deps.YtDlpPath `
+                    -TargetUrl $targetUrl `
+                    -BrowserCookies $ResolvedParams.Cookies `
+                    -NoCheckCertificate `
+                    -RefererUrl $targetUrl `
+                    -OriginUrl $originUrl `
+                    -UserAgent $script:DefaultUserAgent `
+                    -SuppressErrorOutput
+                if ($null -ne $videoInfo) {
+                    $usedLayer1b = $true
+                }
+            }
+            if ($null -eq $videoInfo) {
+                $fallbackOk = Invoke-LayeredFallbackPipeline `
+                    -TargetUrl $targetUrl `
+                    -Deps $deps `
+                    -OutputDir $outputDir `
+                    -SelectedQuality $selectedQuality `
+                    -SelectedFormat $selectedFormat `
+                    -IsAudioOnly:$isAudioOnly `
+                    -SubtitleLangs $ResolvedParams.Subs `
+                    -BrowserCookies $ResolvedParams.Cookies `
+                    -IsInteractive:$isInteractive
+                $script:ProcessExitCode = if ($fallbackOk) { 0 } else { 1 }
                 return
             }
             $resolutions = @(Get-AvailableResolutions -VideoInfo $videoInfo)
@@ -1418,7 +3369,11 @@ function Invoke-VideoDownload {
         -SubtitleLangs $ResolvedParams.Subs `
         -BrowserCookies $ResolvedParams.Cookies `
         -FfmpegPath $ffmpegDir `
-        -PrintFilePath $printFile
+        -PrintFilePath $printFile `
+        -NoCheckCertificate:$usedLayer1b `
+        -RefererUrl $(if ($usedLayer1b) { $targetUrl } else { '' }) `
+        -OriginUrl $(if ($usedLayer1b) { $originUrl } else { '' }) `
+        -UserAgent $(if ($usedLayer1b) { $script:DefaultUserAgent } else { '' })
 
     Write-Host 'İndirme başlatılıyor...' -ForegroundColor Cyan
     $downloadCompleted = $false
@@ -1444,16 +3399,59 @@ function Invoke-VideoDownload {
         Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
     }
 
+    # Katman 1a indirme sırasında başarısız olduysa ve henüz 1b denenmediyse önce 1b'yi dene
+    if ($dlExitCode -ne 0 -and -not $usedLayer1b) {
+        Write-Host '[Katman 1a] İndirme başarısız — [Katman 1b] --no-check-certificate ve Referer başlığıyla tekrar deneniyor...' -ForegroundColor Yellow
+        $usedLayer1b = $true
+        $ytArgs1b = Get-YtDlpArgumentList `
+            -TargetUrl $targetUrl `
+            -SelectedQuality $selectedQuality `
+            -SelectedFormat $selectedFormat `
+            -IsAudioOnly:$isAudioOnly `
+            -OutputDirectory $outputDir `
+            -IncludePlaylist:([bool]$ResolvedParams.Playlist) `
+            -SubtitleLangs $ResolvedParams.Subs `
+            -BrowserCookies $ResolvedParams.Cookies `
+            -FfmpegPath $ffmpegDir `
+            -PrintFilePath $printFile `
+            -NoCheckCertificate `
+            -RefererUrl $targetUrl `
+            -OriginUrl $originUrl `
+            -UserAgent $script:DefaultUserAgent
+
+        $prevEap = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            & $deps.YtDlpPath @ytArgs1b 2>$errFile
+            $dlExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
+        if (Test-Path -LiteralPath $errFile) {
+            $rawErr = Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Katman 1b de başarısızsa DURMA -> Katman 2-5 Pipeline'ına geç!
     if ($dlExitCode -ne 0) {
         if (-not [string]::IsNullOrWhiteSpace($rawErr)) {
             Write-Verbose "yt-dlp ham hata çıktısı:`n$rawErr"
         }
-        $friendlyMsg = Convert-YtDlpErrorToTurkish -RawError $rawErr
-        Write-Host $friendlyMsg -ForegroundColor Red
         if (Test-Path -LiteralPath $printFile) {
             Remove-Item -LiteralPath $printFile -Force -ErrorAction SilentlyContinue
         }
-        $script:ProcessExitCode = 1
+        $fallbackOk = Invoke-LayeredFallbackPipeline `
+            -TargetUrl $targetUrl `
+            -Deps $deps `
+            -OutputDir $outputDir `
+            -SelectedQuality $selectedQuality `
+            -SelectedFormat $selectedFormat `
+            -IsAudioOnly:$isAudioOnly `
+            -SubtitleLangs $ResolvedParams.Subs `
+            -BrowserCookies $ResolvedParams.Cookies `
+            -IsInteractive:$isInteractive
+        $script:ProcessExitCode = if ($fallbackOk) { 0 } else { 1 }
         return
     }
 
@@ -1481,7 +3479,15 @@ function Invoke-VideoDownload {
         }
     }
 
-    Write-Host "İndirme tamamlandı: $finalPath" -ForegroundColor Green
+    $probeInfo = Test-MediaFileWithFfprobe -FilePath $finalPath
+    $layerLabel = if ($usedLayer1b) { 'Katman 1b (yt-dlp + Referer/SSL Bypass)' } else { 'Katman 1a (yt-dlp Doğrudan Çıkarım)' }
+    Write-MediaFetchReport `
+        -Status 'Başarılı' `
+        -FilePathAndSize "$finalPath ($($probeInfo.SizeText))" `
+        -QualityAndCodec $probeInfo.QualitySummary `
+        -StreamUrl $targetUrl `
+        -WorkingLayer $layerLabel `
+        -Notes 'İndirme tamamlandı ve ffprobe ile doğrulandı.'
 
     if ($isInteractive) {
         $openAns = Read-Host -Prompt 'Open folder? (y/N)'
